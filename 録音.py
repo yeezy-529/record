@@ -53,18 +53,19 @@ def write_error_log(title, error):
         pass
 
 
-def safe_messagebox_info(title, message):
+def _safe_messagebox(method, title, message):
     try:
-        messagebox.showinfo(title, message)
+        method(title, message)
     except Exception:
         pass
+
+
+def safe_messagebox_info(title, message):
+    _safe_messagebox(messagebox.showinfo, title, message)
 
 
 def safe_messagebox_error(title, message):
-    try:
-        messagebox.showerror(title, message)
-    except Exception:
-        pass
+    _safe_messagebox(messagebox.showerror, title, message)
 
 
 # =========================
@@ -322,43 +323,38 @@ class AudioRecorder:
                 write_error_log(f"{label} open failed fallback 1ch", e2)
                 raise
 
-    def _system_loop(self):
+    def _capture_loop(self, stream, level_attr, frame_attr, log_title, log_message):
         while self.is_recording:
             try:
-                data = self.system_stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
-
-                self.system_level = self._calc_level(data)
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                setattr(self, level_attr, self._calc_level(data))
 
                 with self.frame_lock:
-                    self.system_frames.append(data)
+                    getattr(self, frame_attr).append(data)
 
             except Exception as e:
-                write_error_log("AudioRecorder._system_loop error", e)
-                self.log(f"相手音声読み取りエラー: {e}")
+                write_error_log(log_title, e)
+                self.log(f"{log_message}: {e}")
                 self.is_recording = False
                 break
+
+    def _system_loop(self):
+        self._capture_loop(
+            stream=self.system_stream,
+            level_attr="system_level",
+            frame_attr="system_frames",
+            log_title="AudioRecorder._system_loop error",
+            log_message="相手音声読み取りエラー",
+        )
 
     def _mic_loop(self):
-        while self.is_recording:
-            try:
-                data = self.mic_stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
-
-                self.mic_level = self._calc_level(data)
-
-                with self.frame_lock:
-                    self.mic_frames.append(data)
-
-            except Exception as e:
-                write_error_log("AudioRecorder._mic_loop error", e)
-                self.log(f"マイク読み取りエラー: {e}")
-                self.is_recording = False
-                break
+        self._capture_loop(
+            stream=self.mic_stream,
+            level_attr="mic_level",
+            frame_attr="mic_frames",
+            log_title="AudioRecorder._mic_loop error",
+            log_message="マイク読み取りエラー",
+        )
 
     def stop(self):
         if not self.is_recording and not self.p:
@@ -591,6 +587,10 @@ class App:
         self.elapsed_seconds = 0
         self.timer_job = None
         self.level_job = None
+        self.preview_streams = []
+        self.preview_audio = None
+        self.preview_thread = None
+        self.preview_running = False
 
         self.last_output_dir = None
 
@@ -776,6 +776,7 @@ class App:
             if self.system_devices and self.mic_devices:
                 self.start_btn.config(state="normal")
                 self.status_var.set("待機中")
+                self.start_preview_level_meter()
             else:
                 self.start_btn.config(state="disabled")
                 self.status_var.set("デバイス未検出")
@@ -795,9 +796,11 @@ class App:
 
         self.status_var.set("待機中")
         self.add_log("デバイスを変更しました。録音開始時に反映します。")
+        self.start_preview_level_meter()
 
     def start_recording(self):
         try:
+            self.stop_preview_level_meter()
             system_pos = self.system_combo.current()
             mic_pos = self.mic_combo.current()
 
@@ -857,6 +860,7 @@ class App:
             if not result:
                 self.status_var.set("待機中")
                 self.enable_controls()
+                self.start_preview_level_meter()
                 return
 
             self.last_output_dir = result["output_dir"]
@@ -916,6 +920,7 @@ class App:
 
         finally:
             self.enable_controls()
+            self.start_preview_level_meter()
 
     def open_output_folder(self):
         folder = self.last_output_dir or BASE_DIR
@@ -955,6 +960,78 @@ class App:
         self.system_combo.config(state="readonly")
         self.mic_combo.config(state="readonly")
 
+    def start_preview_level_meter(self):
+        self.stop_preview_level_meter()
+        if self.recorder.is_recording:
+            return
+
+        system_pos = self.system_combo.current()
+        mic_pos = self.mic_combo.current()
+        if system_pos < 0 or mic_pos < 0:
+            self.reset_level_meter()
+            return
+
+        try:
+            self.preview_audio = pyaudio.PyAudio()
+            system_device = self.system_devices[system_pos]
+            mic_device = self.mic_devices[mic_pos]
+            self.preview_streams = [
+                ("system_level", self.preview_audio.open(
+                    format=FORMAT,
+                    channels=system_device["channels"],
+                    rate=system_device["rate"],
+                    input=True,
+                    input_device_index=system_device["index"],
+                    frames_per_buffer=CHUNK,
+                )),
+                ("mic_level", self.preview_audio.open(
+                    format=FORMAT,
+                    channels=mic_device["channels"],
+                    rate=mic_device["rate"],
+                    input=True,
+                    input_device_index=mic_device["index"],
+                    frames_per_buffer=CHUNK,
+                )),
+            ]
+            self.preview_running = True
+            self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
+            self.preview_thread.start()
+            self.update_level_meter()
+        except Exception as e:
+            write_error_log("App.start_preview_level_meter error", e)
+            self.stop_preview_level_meter()
+            self.add_log(f"入力レベルの事前表示に失敗: {e}")
+
+    def _preview_loop(self):
+        while self.preview_running and not self.recorder.is_recording:
+            try:
+                for attr, stream in self.preview_streams:
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    setattr(self.recorder, attr, self.recorder._calc_level(data))
+            except Exception:
+                break
+
+    def stop_preview_level_meter(self):
+        self.preview_running = False
+        if self.preview_thread:
+            self.preview_thread.join(timeout=1)
+            self.preview_thread = None
+
+        for _, stream in self.preview_streams:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        self.preview_streams = []
+
+        if self.preview_audio:
+            try:
+                self.preview_audio.terminate()
+            except Exception:
+                pass
+            self.preview_audio = None
+
     def update_timer(self):
         minutes = self.elapsed_seconds // 60
         seconds = self.elapsed_seconds % 60
@@ -965,7 +1042,7 @@ class App:
         self.timer_job = self.root.after(1000, self.update_timer)
 
     def update_level_meter(self):
-        if not self.recorder.is_recording:
+        if not self.recorder.is_recording and not self.preview_running:
             self.reset_level_meter()
             return
 
@@ -1004,6 +1081,7 @@ class App:
             if self.level_job:
                 self.root.after_cancel(self.level_job)
 
+            self.stop_preview_level_meter()
             self.recorder.stop()
 
         except Exception as e:
