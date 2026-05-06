@@ -1053,7 +1053,18 @@ class App:
 
     def _open_preview_stream(self, device):
         last_error = None
-        for channels in [device["channels"], 1]:
+        tried = set()
+        dev_info = self.preview_audio.get_device_info_by_index(device["index"])
+        max_input_channels = int(dev_info.get("maxInputChannels", 0))
+        candidate_channels = [device.get("channels", 1), max_input_channels, 1]
+
+        for channels in candidate_channels:
+            channels = int(channels) if channels else 0
+            if channels <= 0 or channels in tried:
+                continue
+            tried.add(channels)
+            if max_input_channels > 0 and channels > max_input_channels:
+                continue
             try:
                 return self.preview_audio.open(
                     format=FORMAT,
@@ -1065,8 +1076,10 @@ class App:
                 )
             except Exception as e:
                 last_error = e
-                write_error_log("App._open_preview_stream error", e)
-        raise RuntimeError(f"preview stream open failed: {last_error}")
+        self.add_log(
+            f"事前感度表示をスキップ: {device.get('name', 'unknown')} ({last_error})"
+        )
+        return None
 
     @staticmethod
     def _is_bluetooth_or_handsfree(name):
@@ -1112,22 +1125,30 @@ class App:
 
             if unstable_pair:
                 self.add_log("Bluetooth/ハンズフリー機器を検出。事前感度表示はマイクのみ有効化します。")
-                self.preview_streams.append(
-                    ("mic_level", self._open_preview_stream(mic_device))
-                )
+                mic_stream = self._open_preview_stream(mic_device)
+                if mic_stream:
+                    self.preview_streams.append(("mic_level", mic_stream))
                 self.recorder.system_level = 0
             else:
-                self.preview_streams.extend([
-                    ("system_level", self._open_preview_stream(system_device)),
-                    ("mic_level", self._open_preview_stream(mic_device)),
-                ])
+                system_stream = self._open_preview_stream(system_device)
+                mic_stream = self._open_preview_stream(mic_device)
+                if system_stream:
+                    self.preview_streams.append(("system_level", system_stream))
+                if mic_stream:
+                    self.preview_streams.append(("mic_level", mic_stream))
+
+            if not self.preview_streams:
+                self.add_log("選択デバイスでは事前感度表示を開始できませんでした。録音は実行可能です。")
+                self.recorder.system_level = 0
+                self.recorder.mic_level = 0
+                return
 
             self.preview_running = True
             self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
             self.preview_thread.start()
             self.update_level_meter()
         except Exception as e:
-            write_error_log("App.start_preview_level_meter error", e)
+            write_error_log("App.start_preview_level_meter fatal error", e)
             self.stop_preview_level_meter()
             self.add_log(f"入力レベルの事前表示に失敗: {e}")
 
