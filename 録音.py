@@ -988,6 +988,20 @@ class App:
                 write_error_log("App._open_preview_stream error", e)
         raise RuntimeError(f"preview stream open failed: {last_error}")
 
+    @staticmethod
+    def _is_bluetooth_or_handsfree(name):
+        lower = (name or "").lower()
+        keywords = [
+            "hands-free",
+            "hands free",
+            "hfp",
+            "hsp",
+            "bluetooth",
+            "ヘッドセット",
+            "ハンズフリー",
+        ]
+        return any(k in lower for k in keywords)
+
     def start_preview_level_meter(self):
         self.preview_start_job = None
         self.stop_preview_level_meter()
@@ -1004,10 +1018,30 @@ class App:
             self.preview_audio = pyaudio.PyAudio()
             system_device = self.system_devices[system_pos]
             mic_device = self.mic_devices[mic_pos]
-            self.preview_streams = [
-                ("system_level", self._open_preview_stream(system_device)),
-                ("mic_level", self._open_preview_stream(mic_device)),
-            ]
+            self.preview_streams = []
+
+            # Bluetooth/ハンズフリー機器は profile 切替時にデバイスが再初期化され、
+            # system + mic を同時に preview open すると不安定になることがあるため
+            # preview はマイク側優先にする。
+            system_name = system_device.get("name", "")
+            mic_name = mic_device.get("name", "")
+            unstable_pair = (
+                self._is_bluetooth_or_handsfree(system_name)
+                or self._is_bluetooth_or_handsfree(mic_name)
+            )
+
+            if unstable_pair:
+                self.add_log("Bluetooth/ハンズフリー機器を検出。事前感度表示はマイクのみ有効化します。")
+                self.preview_streams.append(
+                    ("mic_level", self._open_preview_stream(mic_device))
+                )
+                self.recorder.system_level = 0
+            else:
+                self.preview_streams.extend([
+                    ("system_level", self._open_preview_stream(system_device)),
+                    ("mic_level", self._open_preview_stream(mic_device)),
+                ])
+
             self.preview_running = True
             self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
             self.preview_thread.start()
