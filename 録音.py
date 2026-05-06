@@ -53,6 +53,14 @@ def write_error_log(title, error):
         pass
 
 
+
+
+def sanitize_filename(name):
+    invalid_chars = '<>:"/\\|?*'
+    sanitized = ''.join('_' if ch in invalid_chars else ch for ch in name)
+    sanitized = sanitized.rstrip(' .')
+    return sanitized or 'untitled'
+
 def _safe_messagebox(method, title, message):
     try:
         method(title, message)
@@ -233,8 +241,8 @@ class AudioRecorder:
                 max(1, int(self.mic_device["maxInputChannels"]))
             )
 
-            now_prefix = datetime.now().strftime("%Y年%m月%d日%H:%M")
-            safe_name = (session_name or "").strip()
+            now_prefix = datetime.now().strftime("%Y年%m月%d日%H時%M分")
+            safe_name = sanitize_filename((session_name or "").strip()) if (session_name or "").strip() else ""
             folder_name = f"{now_prefix}-{safe_name}" if safe_name else now_prefix
             self.output_dir = BASE_DIR / folder_name
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -926,10 +934,8 @@ class App:
             self.last_output_dir = result["output_dir"]
 
             self.enqueue_transcription_job(result)
-            if not self.transcription_running:
-                self.start_transcription_queue()
-            if not self.transcription_running:
-                self.status_var.set("待機中")
+            self.add_log("録音停止後に文字起こしキューへ追加しました。文字起こし開始ボタンを押してください。")
+            self.status_var.set("待機中")
             self.enable_controls()
             self.schedule_preview_level_meter()
 
