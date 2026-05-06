@@ -53,18 +53,19 @@ def write_error_log(title, error):
         pass
 
 
-def safe_messagebox_info(title, message):
+def _safe_messagebox(method, title, message):
     try:
-        messagebox.showinfo(title, message)
+        method(title, message)
     except Exception:
         pass
+
+
+def safe_messagebox_info(title, message):
+    _safe_messagebox(messagebox.showinfo, title, message)
 
 
 def safe_messagebox_error(title, message):
-    try:
-        messagebox.showerror(title, message)
-    except Exception:
-        pass
+    _safe_messagebox(messagebox.showerror, title, message)
 
 
 # =========================
@@ -322,43 +323,38 @@ class AudioRecorder:
                 write_error_log(f"{label} open failed fallback 1ch", e2)
                 raise
 
-    def _system_loop(self):
+    def _capture_loop(self, stream, level_attr, frame_attr, log_title, log_message):
         while self.is_recording:
             try:
-                data = self.system_stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
-
-                self.system_level = self._calc_level(data)
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                setattr(self, level_attr, self._calc_level(data))
 
                 with self.frame_lock:
-                    self.system_frames.append(data)
+                    getattr(self, frame_attr).append(data)
 
             except Exception as e:
-                write_error_log("AudioRecorder._system_loop error", e)
-                self.log(f"相手音声読み取りエラー: {e}")
+                write_error_log(log_title, e)
+                self.log(f"{log_message}: {e}")
                 self.is_recording = False
                 break
+
+    def _system_loop(self):
+        self._capture_loop(
+            stream=self.system_stream,
+            level_attr="system_level",
+            frame_attr="system_frames",
+            log_title="AudioRecorder._system_loop error",
+            log_message="相手音声読み取りエラー",
+        )
 
     def _mic_loop(self):
-        while self.is_recording:
-            try:
-                data = self.mic_stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
-
-                self.mic_level = self._calc_level(data)
-
-                with self.frame_lock:
-                    self.mic_frames.append(data)
-
-            except Exception as e:
-                write_error_log("AudioRecorder._mic_loop error", e)
-                self.log(f"マイク読み取りエラー: {e}")
-                self.is_recording = False
-                break
+        self._capture_loop(
+            stream=self.mic_stream,
+            level_attr="mic_level",
+            frame_attr="mic_frames",
+            log_title="AudioRecorder._mic_loop error",
+            log_message="マイク読み取りエラー",
+        )
 
     def stop(self):
         if not self.is_recording and not self.p:
