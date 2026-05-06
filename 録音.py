@@ -8,7 +8,7 @@ import wave
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import pyaudiowpatch as pyaudio
 from faster_whisper import WhisperModel
@@ -18,6 +18,7 @@ from faster_whisper import WhisperModel
 # 設定
 # =========================
 APP_TITLE = "文字起こしレコーダー"
+APP_VERSION = "2026.05.06-hotfix1"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,18 +54,19 @@ def write_error_log(title, error):
         pass
 
 
-def safe_messagebox_info(title, message):
+def _safe_messagebox(method, title, message):
     try:
-        messagebox.showinfo(title, message)
+        method(title, message)
     except Exception:
         pass
+
+
+def safe_messagebox_info(title, message):
+    _safe_messagebox(messagebox.showinfo, title, message)
 
 
 def safe_messagebox_error(title, message):
-    try:
-        messagebox.showerror(title, message)
-    except Exception:
-        pass
+    _safe_messagebox(messagebox.showerror, title, message)
 
 
 # =========================
@@ -213,8 +215,12 @@ class AudioRecorder:
 
             self.p = pyaudio.PyAudio()
 
-            self.system_device = self.p.get_device_info_by_index(system_device_index)
-            self.mic_device = self.p.get_device_info_by_index(mic_device_index)
+            try:
+                self.system_device = self.p.get_device_info_by_index(system_device_index)
+                self.mic_device = self.p.get_device_info_by_index(mic_device_index)
+            except Exception as e:
+                write_error_log("AudioRecorder.start device lookup error", e)
+                raise RuntimeError("選択デバイス情報の取得に失敗しました。デバイス再読み込み後に再実行してください。") from e
 
             self.system_rate = int(self.system_device["defaultSampleRate"])
             self.mic_rate = int(self.mic_device["defaultSampleRate"])
@@ -289,76 +295,77 @@ class AudioRecorder:
             raise
 
     def _open_stream_with_fallback(self, device_index, rate, channels, label):
-        try:
-            return self.p.open(
-                format=FORMAT,
-                channels=channels,
-                rate=rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=CHUNK,
-            )
+        dev = self.p.get_device_info_by_index(device_index)
+        max_ch = max(1, int(dev.get("maxInputChannels", 1)))
+        default_rate = int(dev.get("defaultSampleRate", rate))
 
-        except Exception as e1:
-            write_error_log(f"{label} open failed first try", e1)
-            self.log(f"{label} open失敗。1chで再試行します: {e1}")
+        channel_candidates = []
+        for ch in [channels, max_ch, min(2, max_ch), 1]:
+            if ch and ch not in channel_candidates:
+                channel_candidates.append(ch)
 
+        rate_candidates = []
+        for r in [rate, default_rate, 48000, 44100, 32000, 16000]:
+            if r and r not in rate_candidates:
+                rate_candidates.append(r)
+
+        last_error = None
+        for ch in channel_candidates:
+            for r in rate_candidates:
+                try:
+                    stream = self.p.open(
+                        format=FORMAT,
+                        channels=ch,
+                        rate=int(r),
+                        input=True,
+                        input_device_index=device_index,
+                        frames_per_buffer=CHUNK,
+                    )
+                    if label == "相手音声":
+                        self.system_channels = ch
+                        self.system_rate = int(r)
+                    else:
+                        self.mic_channels = ch
+                        self.mic_rate = int(r)
+                    return stream
+                except Exception as e:
+                    last_error = e
+
+        write_error_log(f"{label} open failed all candidates", last_error)
+        raise RuntimeError(f"{label} の録音開始に失敗しました: {last_error}")
+
+    def _capture_loop(self, stream, level_attr, frame_attr, log_title, log_message):
+        while self.is_recording:
             try:
-                if label == "相手音声":
-                    self.system_channels = 1
-                else:
-                    self.mic_channels = 1
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                setattr(self, level_attr, self._calc_level(data))
 
-                return self.p.open(
-                    format=FORMAT,
-                    channels=1,
-                    rate=rate,
-                    input=True,
-                    input_device_index=device_index,
-                    frames_per_buffer=CHUNK,
-                )
+                with self.frame_lock:
+                    getattr(self, frame_attr).append(data)
 
-            except Exception as e2:
-                write_error_log(f"{label} open failed fallback 1ch", e2)
-                raise
+            except Exception as e:
+                write_error_log(log_title, e)
+                self.log(f"{log_message}: {e}")
+                self.is_recording = False
+                break
 
     def _system_loop(self):
-        while self.is_recording:
-            try:
-                data = self.system_stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
-
-                self.system_level = self._calc_level(data)
-
-                with self.frame_lock:
-                    self.system_frames.append(data)
-
-            except Exception as e:
-                write_error_log("AudioRecorder._system_loop error", e)
-                self.log(f"相手音声読み取りエラー: {e}")
-                self.is_recording = False
-                break
+        self._capture_loop(
+            stream=self.system_stream,
+            level_attr="system_level",
+            frame_attr="system_frames",
+            log_title="AudioRecorder._system_loop error",
+            log_message="相手音声読み取りエラー",
+        )
 
     def _mic_loop(self):
-        while self.is_recording:
-            try:
-                data = self.mic_stream.read(
-                    CHUNK,
-                    exception_on_overflow=False
-                )
-
-                self.mic_level = self._calc_level(data)
-
-                with self.frame_lock:
-                    self.mic_frames.append(data)
-
-            except Exception as e:
-                write_error_log("AudioRecorder._mic_loop error", e)
-                self.log(f"マイク読み取りエラー: {e}")
-                self.is_recording = False
-                break
+        self._capture_loop(
+            stream=self.mic_stream,
+            level_attr="mic_level",
+            frame_attr="mic_frames",
+            log_title="AudioRecorder._mic_loop error",
+            log_message="マイク読み取りエラー",
+        )
 
     def stop(self):
         if not self.is_recording and not self.p:
@@ -591,8 +598,16 @@ class App:
         self.elapsed_seconds = 0
         self.timer_job = None
         self.level_job = None
+        self.preview_streams = []
+        self.preview_audio = None
+        self.preview_thread = None
+        self.preview_running = False
+        self.preview_start_job = None
+        self.preview_delay_ms = 1500
 
         self.last_output_dir = None
+        self.transcription_queue = []
+        self.transcription_running = False
 
         self.build_ui()
 
@@ -730,6 +745,33 @@ class App:
         )
         self.open_error_btn.pack(side="left")
 
+        self.start_transcribe_btn = ttk.Button(
+            btn_frame,
+            text="文字起こし開始",
+            command=self.start_transcription_queue,
+            state="normal"
+        )
+        self.start_transcribe_btn.pack(side="left", padx=(10, 0))
+
+        queue_frame = ttk.LabelFrame(self.root, text="文字起こしキュー", padding=12)
+        queue_frame.pack(fill="both", expand=False, padx=12, pady=(0, 8))
+
+        self.queue_listbox = tk.Listbox(queue_frame, height=6)
+        self.queue_listbox.pack(fill="x", expand=True)
+
+        queue_btn_frame = ttk.Frame(queue_frame)
+        queue_btn_frame.pack(fill="x", pady=(8, 0))
+        ttk.Button(
+            queue_btn_frame,
+            text="フォルダ追加",
+            command=self.add_queue_from_dialog
+        ).pack(side="left")
+        ttk.Button(
+            queue_btn_frame,
+            text="選択削除",
+            command=self.remove_selected_queue
+        ).pack(side="left", padx=(8, 0))
+
         log_frame = ttk.LabelFrame(self.root, text="ログ", padding=12)
         log_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
@@ -737,6 +779,7 @@ class App:
         self.log_text.pack(fill="both", expand=True)
 
         self.add_log("アプリを起動しました。")
+        self.add_log(f"バージョン: {APP_VERSION}")
         self.add_log(f"録音フォルダ: {BASE_DIR}")
         self.add_log(f"エラーログ: {ERROR_LOG}")
 
@@ -776,6 +819,7 @@ class App:
             if self.system_devices and self.mic_devices:
                 self.start_btn.config(state="normal")
                 self.status_var.set("待機中")
+                self.schedule_preview_level_meter()
             else:
                 self.start_btn.config(state="disabled")
                 self.status_var.set("デバイス未検出")
@@ -795,9 +839,11 @@ class App:
 
         self.status_var.set("待機中")
         self.add_log("デバイスを変更しました。録音開始時に反映します。")
+        self.schedule_preview_level_meter()
 
     def start_recording(self):
         try:
+            self.stop_preview_level_meter()
             system_pos = self.system_combo.current()
             mic_pos = self.mic_combo.current()
 
@@ -832,6 +878,9 @@ class App:
             write_error_log("App.start_recording error", e)
             self.status_var.set("エラー")
             self.add_log(f"録音開始失敗: {e}")
+            if "デバイス情報の取得に失敗" in str(e):
+                self.add_log("デバイス構成が変化した可能性があります。デバイスを再読み込みします。")
+                self.load_devices()
             safe_messagebox_error(
                 "エラー",
                 f"録音開始に失敗しました。\n\n{e}\n\n詳細は {ERROR_LOG} を確認してください。"
@@ -857,18 +906,15 @@ class App:
             if not result:
                 self.status_var.set("待機中")
                 self.enable_controls()
+                self.schedule_preview_level_meter()
                 return
 
             self.last_output_dir = result["output_dir"]
 
-            self.status_var.set("文字起こし中")
-            self.add_log("文字起こしを開始します。")
-
-            threading.Thread(
-                target=self.run_transcription,
-                args=(result,),
-                daemon=True
-            ).start()
+            self.enqueue_transcription_job(result)
+            self.status_var.set("待機中")
+            self.enable_controls()
+            self.schedule_preview_level_meter()
 
         except Exception as e:
             write_error_log("App.stop_recording error", e)
@@ -915,7 +961,63 @@ class App:
             )
 
         finally:
-            self.enable_controls()
+            pass
+
+    def enqueue_transcription_job(self, result):
+        self.transcription_queue.append(result)
+        self.refresh_queue_listbox()
+        self.add_log(f"文字起こしキュー追加: {result['output_dir']}")
+
+    def refresh_queue_listbox(self):
+        self.queue_listbox.delete(0, "end")
+        for idx, item in enumerate(self.transcription_queue, start=1):
+            self.queue_listbox.insert("end", f"{idx}. {item['output_dir']}")
+
+    def add_queue_from_dialog(self):
+        folder = filedialog.askdirectory(title="文字起こし対象フォルダを選択")
+        if not folder:
+            return
+        folder = Path(folder)
+        job = {
+            "output_dir": folder,
+            "system_wav": folder / "system.wav",
+            "mic_wav": folder / "mic.wav",
+            "txt_out": folder / "transcript.txt",
+        }
+        if not job["system_wav"].exists() or not job["mic_wav"].exists():
+            safe_messagebox_error("エラー", "system.wav と mic.wav が見つかりません。")
+            return
+        self.enqueue_transcription_job(job)
+
+    def remove_selected_queue(self):
+        selected = self.queue_listbox.curselection()
+        if not selected:
+            return
+        for i in reversed(selected):
+            del self.transcription_queue[i]
+        self.refresh_queue_listbox()
+
+    def start_transcription_queue(self):
+        if self.transcription_running:
+            self.add_log("文字起こしキューは既に実行中です。")
+            return
+        if not self.transcription_queue:
+            self.add_log("文字起こしキューが空です。")
+            return
+        self.transcription_running = True
+        self.status_var.set("文字起こしキュー実行中")
+        threading.Thread(target=self._run_transcription_queue_worker, daemon=True).start()
+
+    def _run_transcription_queue_worker(self):
+        try:
+            while self.transcription_queue:
+                job = self.transcription_queue.pop(0)
+                self.root.after(0, self.refresh_queue_listbox)
+                self.root.after(0, lambda p=job["output_dir"]: self.add_log(f"キュー処理開始: {p}"))
+                self.run_transcription(job)
+        finally:
+            self.transcription_running = False
+            self.root.after(0, lambda: self.status_var.set("待機中"))
 
     def open_output_folder(self):
         folder = self.last_output_dir or BASE_DIR
@@ -955,6 +1057,151 @@ class App:
         self.system_combo.config(state="readonly")
         self.mic_combo.config(state="readonly")
 
+    def schedule_preview_level_meter(self):
+        if self.preview_start_job:
+            self.root.after_cancel(self.preview_start_job)
+            self.preview_start_job = None
+        self.preview_start_job = self.root.after(
+            self.preview_delay_ms,
+            self.start_preview_level_meter
+        )
+
+    def _open_preview_stream(self, device):
+        last_error = None
+        tried = set()
+        dev_info = self.preview_audio.get_device_info_by_index(device["index"])
+        max_input_channels = int(dev_info.get("maxInputChannels", 0))
+        candidate_channels = [device.get("channels", 1), max_input_channels, 1]
+
+        for channels in candidate_channels:
+            channels = int(channels) if channels else 0
+            if channels <= 0 or channels in tried:
+                continue
+            tried.add(channels)
+            if max_input_channels > 0 and channels > max_input_channels:
+                continue
+            try:
+                return self.preview_audio.open(
+                    format=FORMAT,
+                    channels=channels,
+                    rate=device["rate"],
+                    input=True,
+                    input_device_index=device["index"],
+                    frames_per_buffer=CHUNK,
+                )
+            except Exception as e:
+                last_error = e
+        self.add_log(
+            f"事前感度表示をスキップ: {device.get('name', 'unknown')} ({last_error})"
+        )
+        return None
+
+    @staticmethod
+    def _is_bluetooth_or_handsfree(name):
+        lower = (name or "").lower()
+        keywords = [
+            "hands-free",
+            "hands free",
+            "hfp",
+            "hsp",
+            "bluetooth",
+            "ヘッドセット",
+            "ハンズフリー",
+        ]
+        return any(k in lower for k in keywords)
+
+    def start_preview_level_meter(self):
+        self.preview_start_job = None
+        self.stop_preview_level_meter()
+        if self.recorder.is_recording:
+            return
+
+        system_pos = self.system_combo.current()
+        mic_pos = self.mic_combo.current()
+        if system_pos < 0 or mic_pos < 0:
+            self.reset_level_meter()
+            return
+
+        try:
+            self.preview_audio = pyaudio.PyAudio()
+            system_device = self.system_devices[system_pos]
+            mic_device = self.mic_devices[mic_pos]
+            self.preview_streams = []
+
+            # Bluetooth/ハンズフリー機器は profile 切替時にデバイスが再初期化され、
+            # system + mic を同時に preview open すると不安定になることがあるため
+            # preview はマイク側優先にする。
+            system_name = system_device.get("name", "")
+            mic_name = mic_device.get("name", "")
+            unstable_pair = (
+                self._is_bluetooth_or_handsfree(system_name)
+                or self._is_bluetooth_or_handsfree(mic_name)
+            )
+
+            if unstable_pair:
+                self.add_log("Bluetooth/ハンズフリー機器を検出。事前感度表示はマイクのみ有効化します。")
+                mic_stream = self._open_preview_stream(mic_device)
+                if mic_stream:
+                    self.preview_streams.append(("mic_level", mic_stream))
+                self.recorder.system_level = 0
+            else:
+                system_stream = self._open_preview_stream(system_device)
+                mic_stream = self._open_preview_stream(mic_device)
+                if system_stream:
+                    self.preview_streams.append(("system_level", system_stream))
+                if mic_stream:
+                    self.preview_streams.append(("mic_level", mic_stream))
+
+            if not self.preview_streams:
+                self.add_log("選択デバイスでは事前感度表示を開始できませんでした。録音は実行可能です。")
+                self.recorder.system_level = 0
+                self.recorder.mic_level = 0
+                return
+
+            self.preview_running = True
+            self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
+            self.preview_thread.start()
+            self.update_level_meter()
+        except Exception as e:
+            write_error_log("App.start_preview_level_meter fatal error", e)
+            self.stop_preview_level_meter()
+            self.add_log(f"入力レベルの事前表示に失敗: {e}")
+
+    def _preview_loop(self):
+        while self.preview_running and not self.recorder.is_recording:
+            try:
+                for attr, stream in self.preview_streams:
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    setattr(self.recorder, attr, self.recorder._calc_level(data))
+            except Exception as e:
+                write_error_log("App._preview_loop error", e)
+                self.add_log(f"入力レベル監視エラー: {e}")
+                break
+
+    def stop_preview_level_meter(self):
+        self.preview_running = False
+        if self.preview_start_job:
+            self.root.after_cancel(self.preview_start_job)
+            self.preview_start_job = None
+        if self.preview_thread:
+            self.preview_thread.join(timeout=1)
+            self.preview_thread = None
+
+        for _, stream in self.preview_streams:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        self.preview_streams = []
+
+        if self.preview_audio:
+            try:
+                self.preview_audio.terminate()
+            except Exception:
+                pass
+            self.preview_audio = None
+
     def update_timer(self):
         minutes = self.elapsed_seconds // 60
         seconds = self.elapsed_seconds % 60
@@ -965,7 +1212,7 @@ class App:
         self.timer_job = self.root.after(1000, self.update_timer)
 
     def update_level_meter(self):
-        if not self.recorder.is_recording:
+        if not self.recorder.is_recording and not self.preview_running:
             self.reset_level_meter()
             return
 
@@ -1004,6 +1251,7 @@ class App:
             if self.level_job:
                 self.root.after_cancel(self.level_job)
 
+            self.stop_preview_level_meter()
             self.recorder.stop()
 
         except Exception as e:
