@@ -214,8 +214,12 @@ class AudioRecorder:
 
             self.p = pyaudio.PyAudio()
 
-            self.system_device = self.p.get_device_info_by_index(system_device_index)
-            self.mic_device = self.p.get_device_info_by_index(mic_device_index)
+            try:
+                self.system_device = self.p.get_device_info_by_index(system_device_index)
+                self.mic_device = self.p.get_device_info_by_index(mic_device_index)
+            except Exception as e:
+                write_error_log("AudioRecorder.start device lookup error", e)
+                raise RuntimeError("選択デバイス情報の取得に失敗しました。デバイス再読み込み後に再実行してください。") from e
 
             self.system_rate = int(self.system_device["defaultSampleRate"])
             self.mic_rate = int(self.mic_device["defaultSampleRate"])
@@ -290,38 +294,44 @@ class AudioRecorder:
             raise
 
     def _open_stream_with_fallback(self, device_index, rate, channels, label):
-        try:
-            return self.p.open(
-                format=FORMAT,
-                channels=channels,
-                rate=rate,
-                input=True,
-                input_device_index=device_index,
-                frames_per_buffer=CHUNK,
-            )
+        dev = self.p.get_device_info_by_index(device_index)
+        max_ch = max(1, int(dev.get("maxInputChannels", 1)))
+        default_rate = int(dev.get("defaultSampleRate", rate))
 
-        except Exception as e1:
-            write_error_log(f"{label} open failed first try", e1)
-            self.log(f"{label} open失敗。1chで再試行します: {e1}")
+        channel_candidates = []
+        for ch in [channels, max_ch, min(2, max_ch), 1]:
+            if ch and ch not in channel_candidates:
+                channel_candidates.append(ch)
 
-            try:
-                if label == "相手音声":
-                    self.system_channels = 1
-                else:
-                    self.mic_channels = 1
+        rate_candidates = []
+        for r in [rate, default_rate, 48000, 44100, 32000, 16000]:
+            if r and r not in rate_candidates:
+                rate_candidates.append(r)
 
-                return self.p.open(
-                    format=FORMAT,
-                    channels=1,
-                    rate=rate,
-                    input=True,
-                    input_device_index=device_index,
-                    frames_per_buffer=CHUNK,
-                )
+        last_error = None
+        for ch in channel_candidates:
+            for r in rate_candidates:
+                try:
+                    stream = self.p.open(
+                        format=FORMAT,
+                        channels=ch,
+                        rate=int(r),
+                        input=True,
+                        input_device_index=device_index,
+                        frames_per_buffer=CHUNK,
+                    )
+                    if label == "相手音声":
+                        self.system_channels = ch
+                        self.system_rate = int(r)
+                    else:
+                        self.mic_channels = ch
+                        self.mic_rate = int(r)
+                    return stream
+                except Exception as e:
+                    last_error = e
 
-            except Exception as e2:
-                write_error_log(f"{label} open failed fallback 1ch", e2)
-                raise
+        write_error_log(f"{label} open failed all candidates", last_error)
+        raise RuntimeError(f"{label} の録音開始に失敗しました: {last_error}")
 
     def _capture_loop(self, stream, level_attr, frame_attr, log_title, log_message):
         while self.is_recording:
@@ -866,6 +876,9 @@ class App:
             write_error_log("App.start_recording error", e)
             self.status_var.set("エラー")
             self.add_log(f"録音開始失敗: {e}")
+            if "デバイス情報の取得に失敗" in str(e):
+                self.add_log("デバイス構成が変化した可能性があります。デバイスを再読み込みします。")
+                self.load_devices()
             safe_messagebox_error(
                 "エラー",
                 f"録音開始に失敗しました。\n\n{e}\n\n詳細は {ERROR_LOG} を確認してください。"
