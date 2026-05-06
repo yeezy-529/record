@@ -591,6 +591,8 @@ class App:
         self.preview_audio = None
         self.preview_thread = None
         self.preview_running = False
+        self.preview_start_job = None
+        self.preview_delay_ms = 1500
 
         self.last_output_dir = None
 
@@ -776,7 +778,7 @@ class App:
             if self.system_devices and self.mic_devices:
                 self.start_btn.config(state="normal")
                 self.status_var.set("待機中")
-                self.start_preview_level_meter()
+                self.schedule_preview_level_meter()
             else:
                 self.start_btn.config(state="disabled")
                 self.status_var.set("デバイス未検出")
@@ -796,7 +798,7 @@ class App:
 
         self.status_var.set("待機中")
         self.add_log("デバイスを変更しました。録音開始時に反映します。")
-        self.start_preview_level_meter()
+        self.schedule_preview_level_meter()
 
     def start_recording(self):
         try:
@@ -860,7 +862,7 @@ class App:
             if not result:
                 self.status_var.set("待機中")
                 self.enable_controls()
-                self.start_preview_level_meter()
+                self.schedule_preview_level_meter()
                 return
 
             self.last_output_dir = result["output_dir"]
@@ -920,7 +922,7 @@ class App:
 
         finally:
             self.enable_controls()
-            self.start_preview_level_meter()
+            self.schedule_preview_level_meter()
 
     def open_output_folder(self):
         folder = self.last_output_dir or BASE_DIR
@@ -960,7 +962,34 @@ class App:
         self.system_combo.config(state="readonly")
         self.mic_combo.config(state="readonly")
 
+    def schedule_preview_level_meter(self):
+        if self.preview_start_job:
+            self.root.after_cancel(self.preview_start_job)
+            self.preview_start_job = None
+        self.preview_start_job = self.root.after(
+            self.preview_delay_ms,
+            self.start_preview_level_meter
+        )
+
+    def _open_preview_stream(self, device):
+        last_error = None
+        for channels in [device["channels"], 1]:
+            try:
+                return self.preview_audio.open(
+                    format=FORMAT,
+                    channels=channels,
+                    rate=device["rate"],
+                    input=True,
+                    input_device_index=device["index"],
+                    frames_per_buffer=CHUNK,
+                )
+            except Exception as e:
+                last_error = e
+                write_error_log("App._open_preview_stream error", e)
+        raise RuntimeError(f"preview stream open failed: {last_error}")
+
     def start_preview_level_meter(self):
+        self.preview_start_job = None
         self.stop_preview_level_meter()
         if self.recorder.is_recording:
             return
@@ -976,22 +1005,8 @@ class App:
             system_device = self.system_devices[system_pos]
             mic_device = self.mic_devices[mic_pos]
             self.preview_streams = [
-                ("system_level", self.preview_audio.open(
-                    format=FORMAT,
-                    channels=system_device["channels"],
-                    rate=system_device["rate"],
-                    input=True,
-                    input_device_index=system_device["index"],
-                    frames_per_buffer=CHUNK,
-                )),
-                ("mic_level", self.preview_audio.open(
-                    format=FORMAT,
-                    channels=mic_device["channels"],
-                    rate=mic_device["rate"],
-                    input=True,
-                    input_device_index=mic_device["index"],
-                    frames_per_buffer=CHUNK,
-                )),
+                ("system_level", self._open_preview_stream(system_device)),
+                ("mic_level", self._open_preview_stream(mic_device)),
             ]
             self.preview_running = True
             self.preview_thread = threading.Thread(target=self._preview_loop, daemon=True)
@@ -1008,11 +1023,16 @@ class App:
                 for attr, stream in self.preview_streams:
                     data = stream.read(CHUNK, exception_on_overflow=False)
                     setattr(self.recorder, attr, self.recorder._calc_level(data))
-            except Exception:
+            except Exception as e:
+                write_error_log("App._preview_loop error", e)
+                self.add_log(f"入力レベル監視エラー: {e}")
                 break
 
     def stop_preview_level_meter(self):
         self.preview_running = False
+        if self.preview_start_job:
+            self.root.after_cancel(self.preview_start_job)
+            self.preview_start_job = None
         if self.preview_thread:
             self.preview_thread.join(timeout=1)
             self.preview_thread = None
