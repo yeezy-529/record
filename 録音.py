@@ -3,8 +3,10 @@ import os
 import sys
 import struct
 import threading
+import subprocess
 import traceback
 import wave
+import ctypes
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -30,6 +32,7 @@ LANGUAGE = "ja"
 
 MODEL_SIZE = "medium"
 COMPUTE_TYPE = "int8"
+LIDCLOSE_GUID = "5ca83367-6e45-459f-a27b-476b1d01c936"
 
 
 def ensure_error_log():
@@ -409,27 +412,32 @@ class AudioRecorder:
         result = None
 
         try:
-            if self.output_dir and self.system_frames and self.mic_frames:
+            if self.output_dir and (self.system_frames or self.mic_frames):
                 with self.frame_lock:
                     system_frames = list(self.system_frames)
                     mic_frames = list(self.mic_frames)
 
-                self._save_wav(
-                    self.system_wav,
-                    system_frames,
-                    self.system_channels,
-                    self.system_rate
-                )
+                if system_frames:
+                    self._save_wav(
+                        self.system_wav,
+                        system_frames,
+                        self.system_channels,
+                        self.system_rate
+                    )
+                    self.log(f"相手音声保存: {self.system_wav}")
+                else:
+                    self.log("相手音声は保存データがありませんでした。")
 
-                self._save_wav(
-                    self.mic_wav,
-                    mic_frames,
-                    self.mic_channels,
-                    self.mic_rate
-                )
-
-                self.log(f"相手音声保存: {self.system_wav}")
-                self.log(f"マイク音声保存: {self.mic_wav}")
+                if mic_frames:
+                    self._save_wav(
+                        self.mic_wav,
+                        mic_frames,
+                        self.mic_channels,
+                        self.mic_rate
+                    )
+                    self.log(f"マイク音声保存: {self.mic_wav}")
+                else:
+                    self.log("マイク音声は保存データがありませんでした。")
 
                 result = {
                     "output_dir": self.output_dir,
@@ -619,8 +627,10 @@ class App:
         self.last_output_dir = None
         self.transcription_queue = []
         self.transcription_running = False
+        self.default_bg = self.root.cget("bg")
 
         self.build_ui()
+        self.update_recording_visual_state(is_recording=False)
 
         self.root.after(100, self.load_devices)
 
@@ -878,8 +888,10 @@ class App:
 
             self.recording_session_name = self.session_name_var.get().strip()
             self.recorder.start(system_device_index, mic_device_index, self.recording_session_name)
+            self.set_lid_action_keep_running()
 
             self.status_var.set("録音中")
+            self.update_recording_visual_state(is_recording=True)
             self.elapsed_seconds = 0
             self.update_timer()
             self.update_level_meter()
@@ -922,6 +934,8 @@ class App:
                 self.level_job = None
 
             result = self.recorder.stop()
+            self.set_lid_action_sleep()
+            self.update_recording_visual_state(is_recording=False)
 
             self.reset_level_meter()
 
@@ -948,6 +962,7 @@ class App:
                 "エラー",
                 f"録音停止に失敗しました。\n\n{e}\n\n詳細は {ERROR_LOG} を確認してください。"
             )
+            self.update_recording_visual_state(is_recording=False)
 
     def run_transcription(self, result, notify=True):
         try:
@@ -1265,6 +1280,71 @@ class App:
         self.system_level_label.config(text="0%")
         self.mic_level_label.config(text="0%")
 
+    def update_recording_visual_state(self, is_recording):
+        if is_recording:
+            bg = self.default_bg
+            title = f"{APP_TITLE} ● 録音中"
+        else:
+            bg = "#FFB6C1"
+            title = f"{APP_TITLE} ■ 停止中"
+
+        self.root.configure(bg=bg)
+        self.root.title(title)
+        self._flash_taskbar_once()
+
+    def _flash_taskbar_once(self):
+        if os.name != "nt":
+            return
+        try:
+            hwnd = self.root.winfo_id()
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint),
+                    ("hwnd", ctypes.c_void_p),
+                    ("dwFlags", ctypes.c_uint),
+                    ("uCount", ctypes.c_uint),
+                    ("dwTimeout", ctypes.c_uint),
+                ]
+            FLASHW_TRAY = 0x2
+            info = FLASHWINFO(
+                cbSize=ctypes.sizeof(FLASHWINFO),
+                hwnd=ctypes.c_void_p(hwnd),
+                dwFlags=FLASHW_TRAY,
+                uCount=2,
+                dwTimeout=0,
+            )
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        except Exception as e:
+            write_error_log("App._flash_taskbar_once error", e)
+
+    def _set_lid_action(self, ac_value, dc_value):
+        if os.name != "nt":
+            self.add_log("この機能は Windows のみ対応です。")
+            return
+        commands = [
+            ["powercfg", "/SETACVALUEINDEX", "SCHEME_CURRENT", "SUB_BUTTONS", LIDCLOSE_GUID, str(ac_value)],
+            ["powercfg", "/SETDCVALUEINDEX", "SCHEME_CURRENT", "SUB_BUTTONS", LIDCLOSE_GUID, str(dc_value)],
+            ["powercfg", "/SETACTIVE", "SCHEME_CURRENT"],
+        ]
+        for cmd in commands:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+    def set_lid_action_keep_running(self):
+        try:
+            self._set_lid_action(ac_value=0, dc_value=0)
+            self.add_log("電源設定変更: カバーを閉じたときの動作 = 何もしない")
+        except Exception as e:
+            write_error_log("App.set_lid_action_keep_running error", e)
+            self.add_log(f"電源設定変更失敗（録音中）: {e}")
+
+    def set_lid_action_sleep(self):
+        try:
+            self._set_lid_action(ac_value=1, dc_value=1)
+            self.add_log("電源設定変更: カバーを閉じたときの動作 = スリープ")
+        except Exception as e:
+            write_error_log("App.set_lid_action_sleep error", e)
+            self.add_log(f"電源設定変更失敗（停止時）: {e}")
+
     def add_log(self, text):
         if threading.get_ident() != self.main_thread_id:
             self.root.after(0, lambda: self.add_log(text))
@@ -1285,6 +1365,8 @@ class App:
 
             self.stop_preview_level_meter()
             self.recorder.stop()
+            self.set_lid_action_sleep()
+            self.update_recording_visual_state(is_recording=False)
 
         except Exception as e:
             write_error_log("App.on_close error", e)
