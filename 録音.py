@@ -30,8 +30,53 @@ FORMAT = pyaudio.paInt16
 CHUNK = 2048
 LANGUAGE = "ja"
 
-MODEL_SIZE = "medium"
-COMPUTE_TYPE = "int8"
+TRANSCRIBE_PRESETS = {
+    "fast": {
+        "description": "速度優先。精度は最低限。",
+        "model_size": "medium",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 3,
+        "temperature": 0.0,
+        "condition_on_previous_text": False,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+    "balanced": {
+        "description": "通常運用向け。mediumの推奨設定。",
+        "model_size": "medium",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 5,
+        "temperature": 0.0,
+        "condition_on_previous_text": True,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+    "accurate": {
+        "description": "精度優先。large-v3使用。",
+        "model_size": "large-v3",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 5,
+        "temperature": 0.0,
+        "condition_on_previous_text": True,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+    "accurate_plus": {
+        "description": "さらに精度寄り。処理時間は増える。",
+        "model_size": "large-v3",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 8,
+        "temperature": 0.0,
+        "condition_on_previous_text": True,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+}
+
 LIDCLOSE_GUID = "5ca83367-6e45-459f-a27b-476b1d01c936"
 
 
@@ -198,8 +243,11 @@ class AudioRecorder:
             name = d["name"]
             score = 0
 
+            lower = name.lower()
+            if any(k in lower for k in ["ear", "earphone", "earbuds", "headphone", "headset", "イヤホン", "ヘッドホン", "ヘッドセット"]):
+                score += 200
             if "Realtek" in name:
-                score += 100
+                score += 80
             if d["rate"] == 48000:
                 score += 60
             if d["rate"] == 44100:
@@ -207,9 +255,7 @@ class AudioRecorder:
             if d["channels"] >= 2:
                 score += 30
             if "SOUNDPEATS" in name:
-                score += 20
-            if "ヘッドセット" in name:
-                score += 10
+                score += 30
 
             return score
 
@@ -497,24 +543,35 @@ class AudioRecorder:
 # 文字起こし
 # =========================
 class Transcriber:
-    def __init__(self, log_func):
+    def __init__(self, log_func, config_getter=None):
         self.log = log_func
         self.model = None
         self.model_lock = threading.Lock()
+        self.loaded_model_key = None
+        self.config_getter = config_getter
+
+    def get_config(self):
+        if self.config_getter:
+            return self.config_getter()
+        return dict(TRANSCRIBE_PRESETS["balanced"])
 
     def preload_model(self):
         try:
             with self.model_lock:
-                if self.model is not None:
+                cfg = self.get_config()
+                model_key = (cfg["model_size"], cfg["compute_type"], int(cfg["cpu_threads"]))
+                if self.model is not None and self.loaded_model_key == model_key:
                     return
 
-                self.log("文字起こしモデルを読み込み中...")
+                self.log(f"文字起こしモデルを読み込み中... model={cfg['model_size']} compute={cfg['compute_type']}")
 
                 self.model = WhisperModel(
-                    MODEL_SIZE,
+                    cfg["model_size"],
                     device="cpu",
-                    compute_type=COMPUTE_TYPE
+                    compute_type=cfg["compute_type"],
+                    cpu_threads=int(cfg["cpu_threads"])
                 )
+                self.loaded_model_key = model_key
 
                 self.log("文字起こしモデル読み込み完了。")
 
@@ -528,16 +585,15 @@ class Transcriber:
 
             self.log(f"文字起こし開始: {speaker_label}")
 
+            cfg = self.get_config()
             segments, info = self.model.transcribe(
                 str(audio_path),
                 language=LANGUAGE,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=500
-                ),
-                beam_size=10,
-                temperature=0.0,
-                condition_on_previous_text=False,
+                vad_filter=bool(cfg["vad_filter"]),
+                vad_parameters=dict(cfg["vad_parameters"]),
+                beam_size=int(cfg["beam_size"]),
+                temperature=float(cfg["temperature"]),
+                condition_on_previous_text=bool(cfg["condition_on_previous_text"]),
                 word_timestamps=False,
             )
 
@@ -604,7 +660,17 @@ class App:
         self.main_thread_id = threading.get_ident()
 
         self.recorder = AudioRecorder(self.add_log)
-        self.transcriber = Transcriber(self.add_log)
+        self.transcribe_preset_var = tk.StringVar(value="balanced")
+        self.custom_model_var = tk.StringVar(value=TRANSCRIBE_PRESETS["balanced"]["model_size"])
+        self.custom_compute_var = tk.StringVar(value=TRANSCRIBE_PRESETS["balanced"]["compute_type"])
+        self.custom_threads_var = tk.IntVar(value=TRANSCRIBE_PRESETS["balanced"]["cpu_threads"])
+        self.custom_beam_var = tk.IntVar(value=TRANSCRIBE_PRESETS["balanced"]["beam_size"])
+        self.custom_temp_var = tk.DoubleVar(value=TRANSCRIBE_PRESETS["balanced"]["temperature"])
+        self.custom_prev_text_var = tk.BooleanVar(value=TRANSCRIBE_PRESETS["balanced"]["condition_on_previous_text"])
+        self.custom_vad_var = tk.BooleanVar(value=TRANSCRIBE_PRESETS["balanced"]["vad_filter"])
+        self.custom_silence_var = tk.IntVar(value=TRANSCRIBE_PRESETS["balanced"]["vad_parameters"]["min_silence_duration_ms"])
+        self.eta_var = tk.StringVar(value="予想終了: -")
+        self.transcriber = Transcriber(self.add_log, self.get_transcribe_config)
 
         self.system_devices = []
         self.mic_devices = []
@@ -803,6 +869,27 @@ class App:
             command=self.remove_selected_queue
         ).pack(side="left", padx=(8, 0))
 
+
+        preset_frame = ttk.LabelFrame(self.root, text="文字起こし設定", padding=12)
+        preset_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(preset_frame, text="プリセット:").grid(row=0, column=0, sticky="w")
+        preset_values = ["fast", "balanced", "accurate", "accurate_plus", "custom"]
+        self.preset_combo = ttk.Combobox(preset_frame, state="readonly", values=preset_values, textvariable=self.transcribe_preset_var, width=16)
+        self.preset_combo.grid(row=0, column=1, sticky="w", padx=(6, 10))
+        self.preset_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_preset_to_ui())
+        ttk.Label(preset_frame, textvariable=self.eta_var).grid(row=0, column=2, sticky="w")
+        ttk.Label(preset_frame, text="model").grid(row=1, column=0, sticky="w")
+        ttk.Entry(preset_frame, textvariable=self.custom_model_var, width=14).grid(row=1, column=1, sticky="w")
+        ttk.Label(preset_frame, text="compute").grid(row=1, column=2, sticky="w")
+        ttk.Entry(preset_frame, textvariable=self.custom_compute_var, width=10).grid(row=1, column=3, sticky="w")
+        ttk.Label(preset_frame, text="threads").grid(row=1, column=4, sticky="w")
+        ttk.Spinbox(preset_frame, from_=1, to=32, textvariable=self.custom_threads_var, width=5).grid(row=1, column=5, sticky="w")
+        ttk.Label(preset_frame, text="beam").grid(row=2, column=0, sticky="w")
+        ttk.Spinbox(preset_frame, from_=1, to=12, textvariable=self.custom_beam_var, width=5).grid(row=2, column=1, sticky="w")
+        ttk.Label(preset_frame, text="temp").grid(row=2, column=2, sticky="w")
+        ttk.Spinbox(preset_frame, from_=0.0, to=1.0, increment=0.1, textvariable=self.custom_temp_var, width=6).grid(row=2, column=3, sticky="w")
+        ttk.Checkbutton(preset_frame, text="前文脈を使う", variable=self.custom_prev_text_var).grid(row=2, column=4, columnspan=2, sticky="w")
+
         log_frame = ttk.LabelFrame(self.root, text="ログ", padding=12)
         log_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
@@ -967,6 +1054,7 @@ class App:
     def run_transcription(self, result, notify=True):
         try:
             self.root.after(0, lambda: self.status_var.set(f"文字起こし中: {Path(result['output_dir']).name}"))
+            self.root.after(0, lambda: self.eta_var.set(self.estimate_eta_text(result)))
             system_rows = self.transcriber.transcribe_file(
                 result["system_wav"],
                 "相手"
@@ -984,6 +1072,7 @@ class App:
             self.add_log(f"保存フォルダ: {result['output_dir']}")
 
             self.status_var.set("完了")
+            self.eta_var.set("予想終了: 完了")
             if notify:
                 safe_messagebox_info(
                     "完了",
@@ -1065,6 +1154,54 @@ class App:
         finally:
             self.transcription_running = False
             self.root.after(0, lambda: self.status_var.set("待機中"))
+
+
+    def apply_preset_to_ui(self):
+        name = self.transcribe_preset_var.get()
+        if name in TRANSCRIBE_PRESETS:
+            cfg = TRANSCRIBE_PRESETS[name]
+            self.custom_model_var.set(cfg["model_size"])
+            self.custom_compute_var.set(cfg["compute_type"])
+            self.custom_threads_var.set(cfg["cpu_threads"])
+            self.custom_beam_var.set(cfg["beam_size"])
+            self.custom_temp_var.set(cfg["temperature"])
+            self.custom_prev_text_var.set(cfg["condition_on_previous_text"])
+            self.custom_vad_var.set(cfg["vad_filter"])
+            self.custom_silence_var.set(cfg["vad_parameters"]["min_silence_duration_ms"])
+
+    def get_transcribe_config(self):
+        name = self.transcribe_preset_var.get()
+        if name in TRANSCRIBE_PRESETS:
+            return dict(TRANSCRIBE_PRESETS[name])
+        return {
+            "model_size": self.custom_model_var.get().strip() or "medium",
+            "compute_type": self.custom_compute_var.get().strip() or "int8",
+            "cpu_threads": max(1, int(self.custom_threads_var.get())),
+            "beam_size": max(1, int(self.custom_beam_var.get())),
+            "temperature": max(0.0, float(self.custom_temp_var.get())),
+            "condition_on_previous_text": bool(self.custom_prev_text_var.get()),
+            "vad_filter": bool(self.custom_vad_var.get()),
+            "vad_parameters": {"min_silence_duration_ms": max(100, int(self.custom_silence_var.get()))},
+            "description": "custom",
+        }
+
+    def estimate_eta_text(self, result):
+        try:
+            with wave.open(str(result["system_wav"]), "rb") as w1:
+                d1 = w1.getnframes() / max(1, w1.getframerate())
+            with wave.open(str(result["mic_wav"]), "rb") as w2:
+                d2 = w2.getnframes() / max(1, w2.getframerate())
+            total_audio_sec = d1 + d2
+            preset = self.transcribe_preset_var.get()
+            factor = {"fast":0.35,"balanced":0.55,"accurate":0.9,"accurate_plus":1.2}.get(preset,0.8)
+            est = max(10, int(total_audio_sec * factor))
+            done = datetime.now()
+            end = done.timestamp() + est
+            from datetime import timedelta
+            eta = datetime.fromtimestamp(end).strftime("%H:%M:%S")
+            return f"予想終了: 約{est//60}分{est%60}秒 ({eta})"
+        except Exception:
+            return "予想終了: -"
 
     def open_output_folder(self):
         folder = self.last_output_dir or BASE_DIR
@@ -1395,6 +1532,7 @@ def main():
     sys.excepthook = global_exception_handler
 
     root = tk.Tk()
+    root.configure(bg="#FAF7EF")
 
     style = ttk.Style()
 
