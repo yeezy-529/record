@@ -34,6 +34,53 @@ MODEL_SIZE = "medium"
 COMPUTE_TYPE = "int8"
 LIDCLOSE_GUID = "5ca83367-6e45-459f-a27b-476b1d01c936"
 
+TRANSCRIBE_PRESETS = {
+    "fast": {
+        "description": "速度優先。精度は最低限。",
+        "model_size": "medium",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 3,
+        "temperature": 0.0,
+        "condition_on_previous_text": False,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+    "balanced": {
+        "description": "通常運用向け。mediumの推奨設定。",
+        "model_size": "medium",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 5,
+        "temperature": 0.0,
+        "condition_on_previous_text": True,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+    "accurate": {
+        "description": "精度優先。large-v3使用。",
+        "model_size": "large-v3",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 5,
+        "temperature": 0.0,
+        "condition_on_previous_text": True,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+    "accurate_plus": {
+        "description": "さらに精度寄り。処理時間は増える。",
+        "model_size": "large-v3",
+        "compute_type": "int8",
+        "cpu_threads": 10,
+        "beam_size": 8,
+        "temperature": 0.0,
+        "condition_on_previous_text": True,
+        "vad_filter": True,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    },
+}
+
 
 def ensure_error_log():
     try:
@@ -200,6 +247,9 @@ class AudioRecorder:
 
             if "Realtek" in name:
                 score += 100
+            lower = name.lower()
+            if any(k in lower for k in ["headphone", "headset", "ear", "イヤホン", "ヘッドホン", "buds"]):
+                score += 120
             if d["rate"] == 48000:
                 score += 60
             if d["rate"] == 44100:
@@ -500,21 +550,25 @@ class Transcriber:
     def __init__(self, log_func):
         self.log = log_func
         self.model = None
+        self.current_model_key = None
         self.model_lock = threading.Lock()
 
-    def preload_model(self):
+    def preload_model(self, model_size=MODEL_SIZE, compute_type=COMPUTE_TYPE, cpu_threads=10):
         try:
             with self.model_lock:
-                if self.model is not None:
+                model_key = f"{model_size}:{compute_type}:{cpu_threads}"
+                if self.model is not None and self.current_model_key == model_key:
                     return
 
-                self.log("文字起こしモデルを読み込み中...")
+                self.log(f"文字起こしモデルを読み込み中... ({model_size}, {compute_type}, threads={cpu_threads})")
 
                 self.model = WhisperModel(
-                    MODEL_SIZE,
+                    model_size,
                     device="cpu",
-                    compute_type=COMPUTE_TYPE
+                    compute_type=compute_type,
+                    cpu_threads=cpu_threads,
                 )
+                self.current_model_key = model_key
 
                 self.log("文字起こしモデル読み込み完了。")
 
@@ -522,22 +576,24 @@ class Transcriber:
             write_error_log("Transcriber.preload_model error", e)
             raise
 
-    def transcribe_file(self, audio_path, speaker_label):
+    def transcribe_file(self, audio_path, speaker_label, config):
         try:
-            self.preload_model()
+            self.preload_model(
+                model_size=config["model_size"],
+                compute_type=config["compute_type"],
+                cpu_threads=config["cpu_threads"],
+            )
 
             self.log(f"文字起こし開始: {speaker_label}")
 
             segments, info = self.model.transcribe(
                 str(audio_path),
                 language=LANGUAGE,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=500
-                ),
-                beam_size=10,
-                temperature=0.0,
-                condition_on_previous_text=False,
+                vad_filter=config["vad_filter"],
+                vad_parameters=dict(config["vad_parameters"]),
+                beam_size=config["beam_size"],
+                temperature=config["temperature"],
+                condition_on_previous_text=config["condition_on_previous_text"],
                 word_timestamps=False,
             )
 
@@ -600,6 +656,7 @@ class App:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("900x680")
+        self.root.configure(bg="#FAF7EF")
 
         self.main_thread_id = threading.get_ident()
 
@@ -611,7 +668,18 @@ class App:
 
         self.status_var = tk.StringVar(value="起動中")
         self.timer_var = tk.StringVar(value="録音時間: 00:00")
+        self.transcribe_status_var = tk.StringVar(value="文字起こし状態: 待機中")
+        self.eta_var = tk.StringVar(value="推定終了時刻: --:--:--")
         self.session_name_var = tk.StringVar(value="")
+        self.preset_var = tk.StringVar(value="balanced")
+        self.model_size_var = tk.StringVar(value=TRANSCRIBE_PRESETS["balanced"]["model_size"])
+        self.compute_type_var = tk.StringVar(value=TRANSCRIBE_PRESETS["balanced"]["compute_type"])
+        self.cpu_threads_var = tk.IntVar(value=TRANSCRIBE_PRESETS["balanced"]["cpu_threads"])
+        self.beam_size_var = tk.IntVar(value=TRANSCRIBE_PRESETS["balanced"]["beam_size"])
+        self.temperature_var = tk.DoubleVar(value=TRANSCRIBE_PRESETS["balanced"]["temperature"])
+        self.condition_prev_var = tk.BooleanVar(value=TRANSCRIBE_PRESETS["balanced"]["condition_on_previous_text"])
+        self.vad_filter_var = tk.BooleanVar(value=TRANSCRIBE_PRESETS["balanced"]["vad_filter"])
+        self.vad_silence_var = tk.IntVar(value=TRANSCRIBE_PRESETS["balanced"]["vad_parameters"]["min_silence_duration_ms"])
         self.recording_session_name = ""
 
         self.elapsed_seconds = 0
@@ -635,6 +703,11 @@ class App:
         self.root.after(100, self.load_devices)
 
     def build_ui(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
         top_frame = ttk.Frame(self.root, padding=12)
         top_frame.pack(fill="x")
 
@@ -700,6 +773,29 @@ class App:
             padx=(4, 24)
         )
         ttk.Label(status_frame, textvariable=self.timer_var).pack(side="left")
+        ttk.Label(status_frame, textvariable=self.transcribe_status_var).pack(side="left", padx=(24, 10))
+        ttk.Label(status_frame, textvariable=self.eta_var).pack(side="left")
+
+        preset_frame = ttk.LabelFrame(self.root, text="文字起こし設定", padding=12)
+        preset_frame.pack(fill="x", padx=12, pady=(8, 0))
+        ttk.Label(preset_frame, text="プリセット:").grid(row=0, column=0, sticky="w")
+        preset_combo = ttk.Combobox(preset_frame, state="readonly", textvariable=self.preset_var, values=list(TRANSCRIBE_PRESETS.keys()), width=16)
+        preset_combo.grid(row=0, column=1, sticky="w", padx=(6, 16))
+        preset_combo.bind("<<ComboboxSelected>>", self.on_preset_changed)
+        ttk.Label(preset_frame, text="model_size").grid(row=0, column=2, sticky="w")
+        ttk.Entry(preset_frame, textvariable=self.model_size_var, width=12).grid(row=0, column=3, padx=4, sticky="w")
+        ttk.Label(preset_frame, text="compute_type").grid(row=0, column=4, sticky="w")
+        ttk.Entry(preset_frame, textvariable=self.compute_type_var, width=10).grid(row=0, column=5, padx=4, sticky="w")
+        ttk.Label(preset_frame, text="threads").grid(row=0, column=6, sticky="w")
+        ttk.Spinbox(preset_frame, from_=1, to=32, textvariable=self.cpu_threads_var, width=5).grid(row=0, column=7, padx=4, sticky="w")
+        ttk.Label(preset_frame, text="beam").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Spinbox(preset_frame, from_=1, to=12, textvariable=self.beam_size_var, width=5).grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(preset_frame, text="temperature").grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(preset_frame, textvariable=self.temperature_var, width=8).grid(row=1, column=3, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(preset_frame, text="前文脈を使う", variable=self.condition_prev_var).grid(row=1, column=4, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(preset_frame, text="VAD有効", variable=self.vad_filter_var).grid(row=1, column=6, sticky="w", pady=(8, 0))
+        ttk.Label(preset_frame, text="無音ms").grid(row=1, column=7, sticky="e", pady=(8, 0))
+        ttk.Spinbox(preset_frame, from_=100, to=3000, increment=100, textvariable=self.vad_silence_var, width=6).grid(row=1, column=8, padx=4, sticky="w", pady=(8, 0))
 
         name_frame = ttk.Frame(self.root, padding=(12, 4))
         name_frame.pack(fill="x")
@@ -897,7 +993,11 @@ class App:
             self.update_level_meter()
 
             threading.Thread(
-                target=self.transcriber.preload_model,
+                target=lambda: self.transcriber.preload_model(
+                    model_size=self.get_transcribe_config()["model_size"],
+                    compute_type=self.get_transcribe_config()["compute_type"],
+                    cpu_threads=self.get_transcribe_config()["cpu_threads"],
+                ),
                 daemon=True
             ).start()
 
@@ -966,15 +1066,20 @@ class App:
 
     def run_transcription(self, result, notify=True):
         try:
+            config = self.get_transcribe_config()
             self.root.after(0, lambda: self.status_var.set(f"文字起こし中: {Path(result['output_dir']).name}"))
+            self.root.after(0, lambda: self.transcribe_status_var.set(f"文字起こし状態: 実行中 ({config['model_size']})"))
+            self.root.after(0, lambda: self.eta_var.set(f"推定終了時刻: {self.estimate_transcribe_end_time(result)}"))
             system_rows = self.transcriber.transcribe_file(
                 result["system_wav"],
-                "相手"
+                "相手",
+                config,
             )
 
             mic_rows = self.transcriber.transcribe_file(
                 result["mic_wav"],
-                "自分"
+                "自分",
+                config,
             )
 
             all_rows = system_rows + mic_rows
@@ -984,6 +1089,8 @@ class App:
             self.add_log(f"保存フォルダ: {result['output_dir']}")
 
             self.status_var.set("完了")
+            self.transcribe_status_var.set("文字起こし状態: 完了")
+            self.eta_var.set("推定終了時刻: --:--:--")
             if notify:
                 safe_messagebox_info(
                     "完了",
@@ -994,6 +1101,7 @@ class App:
         except Exception as e:
             write_error_log("App.run_transcription error", e)
             self.status_var.set("エラー")
+            self.transcribe_status_var.set("文字起こし状態: エラー")
             self.add_log(f"文字起こしエラー: {e}")
             safe_messagebox_error(
                 "エラー",
@@ -1047,6 +1155,7 @@ class App:
             return
         self.transcription_running = True
         self.status_var.set("文字起こしキュー実行中")
+        self.transcribe_status_var.set("文字起こし状態: キュー実行中")
         threading.Thread(target=self._run_transcription_queue_worker, daemon=True).start()
 
     def _run_transcription_queue_worker(self):
@@ -1065,6 +1174,45 @@ class App:
         finally:
             self.transcription_running = False
             self.root.after(0, lambda: self.status_var.set("待機中"))
+            self.root.after(0, lambda: self.transcribe_status_var.set("文字起こし状態: 待機中"))
+            self.root.after(0, lambda: self.eta_var.set("推定終了時刻: --:--:--"))
+
+    def on_preset_changed(self, event=None):
+        preset = TRANSCRIBE_PRESETS.get(self.preset_var.get())
+        if not preset:
+            return
+        self.model_size_var.set(preset["model_size"])
+        self.compute_type_var.set(preset["compute_type"])
+        self.cpu_threads_var.set(preset["cpu_threads"])
+        self.beam_size_var.set(preset["beam_size"])
+        self.temperature_var.set(preset["temperature"])
+        self.condition_prev_var.set(preset["condition_on_previous_text"])
+        self.vad_filter_var.set(preset["vad_filter"])
+        self.vad_silence_var.set(preset["vad_parameters"]["min_silence_duration_ms"])
+
+    def get_transcribe_config(self):
+        return {
+            "model_size": self.model_size_var.get().strip() or "medium",
+            "compute_type": self.compute_type_var.get().strip() or "int8",
+            "cpu_threads": max(1, int(self.cpu_threads_var.get())),
+            "beam_size": max(1, int(self.beam_size_var.get())),
+            "temperature": float(self.temperature_var.get()),
+            "condition_on_previous_text": bool(self.condition_prev_var.get()),
+            "vad_filter": bool(self.vad_filter_var.get()),
+            "vad_parameters": {"min_silence_duration_ms": max(100, int(self.vad_silence_var.get()))},
+        }
+
+    def estimate_transcribe_end_time(self, result):
+        try:
+            total_secs = 0.0
+            for wav_path in [result["system_wav"], result["mic_wav"]]:
+                with wave.open(str(wav_path), "rb") as wf:
+                    total_secs += wf.getnframes() / float(wf.getframerate() or 1)
+            multiplier = 1.8 if "large" in self.model_size_var.get() else 1.1
+            eta = datetime.now().timestamp() + total_secs * multiplier
+            return datetime.fromtimestamp(eta).strftime("%H:%M:%S")
+        except Exception:
+            return "--:--:--"
 
     def open_output_folder(self):
         folder = self.last_output_dir or BASE_DIR
