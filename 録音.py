@@ -599,7 +599,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x680")
+        self.root.geometry("980x720")
 
         self.main_thread_id = threading.get_ident()
 
@@ -635,6 +635,12 @@ class App:
         self.root.after(100, self.load_devices)
 
     def build_ui(self):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
         top_frame = ttk.Frame(self.root, padding=12)
         top_frame.pack(fill="x")
 
@@ -644,38 +650,38 @@ class App:
             font=("Yu Gothic UI", 16, "bold")
         ).pack(anchor="w")
 
-        desc = (
-            "録音開始時だけ音声デバイスを開きます。\n"
-            "録音停止後、文字起こしのみを txt 保存します。"
-        )
+        desc = "メイン画面で録音。その他はタブで切り替えできます。"
         ttk.Label(top_frame, text=desc).pack(anchor="w", pady=(6, 10))
 
-        device_frame = ttk.LabelFrame(self.root, text="録音デバイス選択", padding=12)
-        device_frame.pack(fill="x", padx=12, pady=(0, 8))
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        ttk.Label(device_frame, text="スピーカー / 相手音声:").grid(
-            row=0,
-            column=0,
-            sticky="w"
-        )
+        main_tab = ttk.Frame(notebook, padding=12)
+        queue_tab = ttk.Frame(notebook, padding=12)
+        log_tab = ttk.Frame(notebook, padding=12)
+
+        notebook.add(main_tab, text="メイン")
+        notebook.add(queue_tab, text="文字起こしキュー")
+        notebook.add(log_tab, text="ログ")
+
+        device_frame = ttk.LabelFrame(main_tab, text="音声設定", padding=12)
+        device_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(device_frame, text="相手の声:").grid(row=0, column=0, sticky="w")
 
         self.system_combo = ttk.Combobox(
             device_frame,
             state="readonly",
-            width=80
+            width=72
         )
         self.system_combo.grid(row=0, column=1, padx=8, pady=4, sticky="ew")
 
-        ttk.Label(device_frame, text="マイク / 自分の声:").grid(
-            row=1,
-            column=0,
-            sticky="w"
-        )
+        ttk.Label(device_frame, text="自分の声:").grid(row=1, column=0, sticky="w")
 
         self.mic_combo = ttk.Combobox(
             device_frame,
             state="readonly",
-            width=80
+            width=72
         )
         self.mic_combo.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
 
@@ -684,85 +690,56 @@ class App:
 
         self.reload_btn = ttk.Button(
             device_frame,
-            text="デバイス再読み込み",
+            text="再読み込み",
             command=self.load_devices
         )
         self.reload_btn.grid(row=2, column=1, sticky="e", pady=(8, 0))
-
         device_frame.columnconfigure(1, weight=1)
 
-        status_frame = ttk.Frame(self.root, padding=(12, 0))
-        status_frame.pack(fill="x")
+        status_frame = ttk.LabelFrame(main_tab, text="基本ステータス", padding=12)
+        status_frame.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(status_frame, text="状態:").pack(side="left")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(
-            side="left",
-            padx=(4, 24)
-        )
-        ttk.Label(status_frame, textvariable=self.timer_var).pack(side="left")
+        ttk.Label(status_frame, text="状態:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(6, 20))
+        ttk.Label(status_frame, textvariable=self.timer_var).grid(row=0, column=2, sticky="w")
 
-        name_frame = ttk.Frame(self.root, padding=(12, 4))
-        name_frame.pack(fill="x")
-        ttk.Label(name_frame, text="任意名:").pack(side="left")
-        self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
-        self.name_entry.pack(side="left", padx=(6, 8))
-        ttk.Label(
-            name_frame,
-            text="フォルダ/文字起こし名: yyyy年mm月dd日hh:MM-任意名（録音停止で確定）"
-        ).pack(side="left")
+        level_frame = ttk.Frame(status_frame)
+        level_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
 
-        level_frame = ttk.LabelFrame(self.root, text="録音中の入力レベル", padding=12)
-        level_frame.pack(fill="x", padx=12, pady=(8, 0))
-
-        ttk.Label(level_frame, text="相手音声:").grid(row=0, column=0, sticky="w")
-
-        self.system_level_bar = ttk.Progressbar(
-            level_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100
-        )
+        ttk.Label(level_frame, text="相手音量:").grid(row=0, column=0, sticky="w")
+        self.system_level_bar = ttk.Progressbar(level_frame, orient="horizontal", mode="determinate", maximum=100)
         self.system_level_bar.grid(row=0, column=1, padx=8, pady=4, sticky="ew")
-
         self.system_level_label = ttk.Label(level_frame, text="0%")
         self.system_level_label.grid(row=0, column=2, sticky="e")
 
-        ttk.Label(level_frame, text="マイク:").grid(row=1, column=0, sticky="w")
-
-        self.mic_level_bar = ttk.Progressbar(
-            level_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100
-        )
+        ttk.Label(level_frame, text="自分音量:").grid(row=1, column=0, sticky="w")
+        self.mic_level_bar = ttk.Progressbar(level_frame, orient="horizontal", mode="determinate", maximum=100)
         self.mic_level_bar.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
-
         self.mic_level_label = ttk.Label(level_frame, text="0%")
         self.mic_level_label.grid(row=1, column=2, sticky="e")
-
         level_frame.columnconfigure(1, weight=1)
 
-        btn_frame = ttk.Frame(self.root, padding=12)
-        btn_frame.pack(fill="x")
+        control_frame = ttk.Frame(main_tab)
+        control_frame.pack(fill="x", pady=(4, 0))
 
         self.start_btn = ttk.Button(
-            btn_frame,
-            text="録音開始",
+            control_frame,
+            text="録画開始",
             command=self.start_recording,
             state="disabled"
         )
         self.start_btn.pack(side="left", padx=(0, 10))
 
         self.stop_btn = ttk.Button(
-            btn_frame,
-            text="録音停止",
+            control_frame,
+            text="録画停止",
             command=self.stop_recording,
             state="disabled"
         )
         self.stop_btn.pack(side="left", padx=(0, 10))
 
         self.open_folder_btn = ttk.Button(
-            btn_frame,
+            control_frame,
             text="録音フォルダを開く",
             command=self.open_output_folder,
             state="normal"
@@ -770,43 +747,31 @@ class App:
         self.open_folder_btn.pack(side="left", padx=(0, 10))
 
         self.open_error_btn = ttk.Button(
-            btn_frame,
+            control_frame,
             text="エラーログを開く",
             command=self.open_error_log
         )
         self.open_error_btn.pack(side="left")
 
+        queue_top = ttk.Frame(queue_tab)
+        queue_top.pack(fill="x", pady=(0, 8))
         self.start_transcribe_btn = ttk.Button(
-            btn_frame,
+            queue_top,
             text="文字起こし開始",
             command=self.start_transcription_queue,
             state="normal"
         )
-        self.start_transcribe_btn.pack(side="left", padx=(10, 0))
+        self.start_transcribe_btn.pack(side="left")
 
-        queue_frame = ttk.LabelFrame(self.root, text="文字起こしキュー", padding=12)
-        queue_frame.pack(fill="both", expand=False, padx=12, pady=(0, 8))
+        self.queue_listbox = tk.Listbox(queue_tab, height=14)
+        self.queue_listbox.pack(fill="both", expand=True)
 
-        self.queue_listbox = tk.Listbox(queue_frame, height=6)
-        self.queue_listbox.pack(fill="x", expand=True)
-
-        queue_btn_frame = ttk.Frame(queue_frame)
+        queue_btn_frame = ttk.Frame(queue_tab)
         queue_btn_frame.pack(fill="x", pady=(8, 0))
-        ttk.Button(
-            queue_btn_frame,
-            text="フォルダ追加",
-            command=self.add_queue_from_dialog
-        ).pack(side="left")
-        ttk.Button(
-            queue_btn_frame,
-            text="選択削除",
-            command=self.remove_selected_queue
-        ).pack(side="left", padx=(8, 0))
+        ttk.Button(queue_btn_frame, text="フォルダ追加", command=self.add_queue_from_dialog).pack(side="left")
+        ttk.Button(queue_btn_frame, text="選択削除", command=self.remove_selected_queue).pack(side="left", padx=(8, 0))
 
-        log_frame = ttk.LabelFrame(self.root, text="ログ", padding=12)
-        log_frame.pack(fill="both", expand=True, padx=12, pady=12)
-
-        self.log_text = tk.Text(log_frame, height=20, wrap="word")
+        self.log_text = tk.Text(log_tab, height=22, wrap="word")
         self.log_text.pack(fill="both", expand=True)
 
         self.add_log("アプリを起動しました。")
