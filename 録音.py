@@ -165,6 +165,55 @@ class AudioRecorder:
         self.txt_out = None
 
     @staticmethod
+    def _device_name_lower(device):
+        return (device.get("name", "") or "").lower()
+
+    @staticmethod
+    def _is_headset_device(device):
+        name = AudioRecorder._device_name_lower(device)
+        keywords = [
+            "ヘッドセット",
+            "headset",
+            "hands-free",
+            "hands free",
+            "hfp",
+            "hsp",
+            "soundpeats",
+        ]
+        return any(keyword in name for keyword in keywords)
+
+    @staticmethod
+    def _is_headphone_device(device):
+        name = AudioRecorder._device_name_lower(device)
+        keywords = [
+            "ヘッドホン",
+            "ヘッドフォン",
+            "headphone",
+            "headphones",
+            "bluetooth",
+        ]
+        return any(keyword in name for keyword in keywords)
+
+    @staticmethod
+    def device_label(device, fallback_kind="デバイス"):
+        raw_name = device.get("name", "") or "不明なデバイス"
+        display_name = raw_name.replace("[Loopback]", "").replace("(Loopback)", "").strip()
+        display_name = display_name.replace("  ", " ")
+
+        if AudioRecorder._is_headset_device(device):
+            kind = "ヘッドセット"
+        elif AudioRecorder._is_headphone_device(device):
+            kind = "ヘッドホン"
+        elif "スピーカー" in raw_name or "speaker" in raw_name.lower():
+            kind = "スピーカー"
+        elif "マイク" in raw_name or "microphone" in raw_name.lower() or "mic" in raw_name.lower():
+            kind = "マイク"
+        else:
+            kind = fallback_kind
+
+        return f"{kind}: {display_name}"
+
+    @staticmethod
     def list_devices():
         p = pyaudio.PyAudio()
         system_devices = []
@@ -176,9 +225,6 @@ class AudioRecorder:
                 name = dev.get("name", "")
                 rate = int(dev.get("defaultSampleRate", 0))
                 ch = int(dev.get("maxInputChannels", 0))
-
-                # Bluetoothヘッドセット系loopbackは落ちやすいので除外
-                
 
                 if ch <= 0:
                     continue
@@ -228,36 +274,42 @@ class AudioRecorder:
             p.terminate()
 
         def system_priority(d):
-            name = d["name"]
+            name = d["name"].lower()
             score = 0
 
+            if AudioRecorder._is_headset_device(d):
+                score += 300
+            if AudioRecorder._is_headphone_device(d):
+                score += 250
+            if "スピーカー" in d["name"] or "speaker" in name:
+                score += 80
             if d["rate"] == 48000:
                 score += 60
             if d["rate"] == 44100:
                 score += 40
-            if "スピーカー" in name or "Speaker" in name:
-                score += 40
-            if "Realtek" in name:
+            if "realtek" in name:
                 score += 30
 
             return score
 
         def mic_priority(d):
-            name = d["name"]
+            name = d["name"].lower()
             score = 0
 
-            if "Realtek" in name:
-                score += 100
+            if AudioRecorder._is_headset_device(d):
+                score += 300
+            if AudioRecorder._is_headphone_device(d):
+                score += 250
+            if "マイク" in d["name"] or "microphone" in name or "mic" in name:
+                score += 80
             if d["rate"] == 48000:
                 score += 60
             if d["rate"] == 44100:
                 score += 40
             if d["channels"] >= 2:
                 score += 30
-            if "SOUNDPEATS" in name:
+            if "realtek" in name:
                 score += 20
-            if "ヘッドセット" in name:
-                score += 10
 
             return score
 
@@ -1143,13 +1195,13 @@ class App:
             self.system_devices, self.mic_devices = AudioRecorder.list_devices()
 
             system_names = [
-                f"{d['name']} / {d['rate']}Hz / {d['channels']}ch"
+                AudioRecorder.device_label(d, fallback_kind="スピーカー")
                 for d in self.system_devices
             ]
 
             mic_names = [
-                f"おすすめ{idx + 1}: {d['name']} / {d['rate']}Hz / {d['channels']}ch"
-                for idx, d in enumerate(self.mic_devices)
+                AudioRecorder.device_label(d, fallback_kind="マイク")
+                for d in self.mic_devices
             ]
 
             self.system_combo["values"] = system_names
