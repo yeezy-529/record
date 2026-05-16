@@ -635,7 +635,18 @@ class App:
         self.root.after(100, self.load_devices)
 
     def build_ui(self):
-        top_frame = ttk.Frame(self.root, padding=12)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=20, pady=20)
+
+        record_tab = ttk.Frame(notebook, style="TabContent.TFrame", padding=12)
+        queue_tab = ttk.Frame(notebook, style="TabContent.TFrame", padding=12)
+        log_tab = ttk.Frame(notebook, style="TabContent.TFrame", padding=12)
+
+        notebook.add(record_tab, text="ホーム")
+        notebook.add(queue_tab, text="分析")
+        notebook.add(log_tab, text="設定")
+
+        top_frame = ttk.Frame(record_tab, padding=12)
         top_frame.pack(fill="x")
 
         ttk.Label(
@@ -650,7 +661,7 @@ class App:
         )
         ttk.Label(top_frame, text=desc).pack(anchor="w", pady=(6, 10))
 
-        device_frame = ttk.LabelFrame(self.root, text="録音デバイス選択", padding=12)
+        device_frame = ttk.LabelFrame(record_tab, text="録音デバイス選択", padding=12)
         device_frame.pack(fill="x", padx=12, pady=(0, 8))
 
         ttk.Label(device_frame, text="スピーカー / 相手音声:").grid(
@@ -691,7 +702,7 @@ class App:
 
         device_frame.columnconfigure(1, weight=1)
 
-        status_frame = ttk.Frame(self.root, padding=(12, 0))
+        status_frame = ttk.Frame(record_tab, padding=(12, 0))
         status_frame.pack(fill="x")
 
         ttk.Label(status_frame, text="状態:").pack(side="left")
@@ -701,7 +712,7 @@ class App:
         )
         ttk.Label(status_frame, textvariable=self.timer_var).pack(side="left")
 
-        name_frame = ttk.Frame(self.root, padding=(12, 4))
+        name_frame = ttk.Frame(record_tab, padding=(12, 4))
         name_frame.pack(fill="x")
         ttk.Label(name_frame, text="任意名:").pack(side="left")
         self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
@@ -711,7 +722,7 @@ class App:
             text="フォルダ/文字起こし名: yyyy年mm月dd日hh:MM-任意名（録音停止で確定）"
         ).pack(side="left")
 
-        level_frame = ttk.LabelFrame(self.root, text="録音中の入力レベル", padding=12)
+        level_frame = ttk.LabelFrame(record_tab, text="録音中の入力レベル", padding=12)
         level_frame.pack(fill="x", padx=12, pady=(8, 0))
 
         ttk.Label(level_frame, text="相手音声:").grid(row=0, column=0, sticky="w")
@@ -742,7 +753,7 @@ class App:
 
         level_frame.columnconfigure(1, weight=1)
 
-        btn_frame = ttk.Frame(self.root, padding=12)
+        btn_frame = ttk.Frame(record_tab, padding=12)
         btn_frame.pack(fill="x")
 
         self.start_btn = ttk.Button(
@@ -784,11 +795,11 @@ class App:
         )
         self.start_transcribe_btn.pack(side="left", padx=(10, 0))
 
-        queue_frame = ttk.LabelFrame(self.root, text="文字起こしキュー", padding=12)
-        queue_frame.pack(fill="both", expand=False, padx=12, pady=(0, 8))
+        queue_frame = ttk.LabelFrame(queue_tab, text="文字起こしキュー", padding=12)
+        queue_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-        self.queue_listbox = tk.Listbox(queue_frame, height=6)
-        self.queue_listbox.pack(fill="x", expand=True)
+        self.queue_listbox = tk.Listbox(queue_frame, height=10)
+        self.queue_listbox.pack(fill="both", expand=True)
 
         queue_btn_frame = ttk.Frame(queue_frame)
         queue_btn_frame.pack(fill="x", pady=(8, 0))
@@ -803,7 +814,7 @@ class App:
             command=self.remove_selected_queue
         ).pack(side="left", padx=(8, 0))
 
-        log_frame = ttk.LabelFrame(self.root, text="ログ", padding=12)
+        log_frame = ttk.LabelFrame(log_tab, text="ログ", padding=12)
         log_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
         self.log_text = tk.Text(log_frame, height=20, wrap="word")
@@ -1399,9 +1410,12 @@ def main():
     style = ttk.Style()
 
     try:
-        style.theme_use("vista")
+        style.theme_use("clam")
     except Exception:
         pass
+
+    style.configure("TNotebook.Tab", padding=(20, 10), font=("Yu Gothic UI", 10, "bold"))
+    style.configure("TabContent.TFrame", background="#f3f4f6")
 
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
