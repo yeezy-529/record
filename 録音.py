@@ -79,12 +79,6 @@ def write_error_log(title, error):
 
 
 
-def sanitize_filename(name):
-    invalid_chars = '<>:"/\\|?*'
-    sanitized = ''.join('_' if ch in invalid_chars else ch for ch in name)
-    sanitized = sanitized.rstrip(' .')
-    return sanitized or 'untitled'
-
 def _safe_messagebox(method, title, message):
     try:
         method(title, message)
@@ -299,7 +293,7 @@ class AudioRecorder:
 
         return system_devices, mic_devices
 
-    def start(self, system_device_index, mic_device_index, session_name):
+    def start(self, system_device_index, mic_device_index):
         try:
             if self.is_recording:
                 return
@@ -326,8 +320,7 @@ class AudioRecorder:
             )
 
             now_prefix = datetime.now().strftime("%Y年%m月%d日%H時%M分")
-            safe_name = sanitize_filename((session_name or "").strip()) if (session_name or "").strip() else ""
-            folder_name = f"{now_prefix}-{safe_name}" if safe_name else now_prefix
+            folder_name = now_prefix
             self.output_dir = BASE_DIR / folder_name
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -664,11 +657,18 @@ class Transcriber:
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    def export_transcript(self, rows, txt_path):
+    def export_transcript(self, rows, txt_path, memo_text=""):
         try:
             rows = sorted(rows, key=lambda x: x["start"])
 
             with open(txt_path, "w", encoding="utf-8") as f:
+                memo_text = (memo_text or "").strip()
+                if memo_text:
+                    f.write("メモ\n")
+                    f.write("=" * 50 + "\n")
+                    f.write(memo_text)
+                    f.write("\n\n")
+
                 f.write("文字起こし\n")
                 f.write("=" * 50 + "\n\n")
 
@@ -742,8 +742,8 @@ class App:
         self.model_var = tk.StringVar(value=MODEL_CHOICES[self.app_settings["model_size"]])
         self.mode_var = tk.StringVar(value=self.app_settings["mode"])
         self.settings_summary_var = tk.StringVar()
-        self.session_name_var = tk.StringVar(value="")
-        self.recording_session_name = ""
+        self.recording_system_label_var = tk.StringVar(value="相手音声: 0%")
+        self.recording_mic_label_var = tk.StringVar(value="マイク: 0%")
 
         self.elapsed_seconds = 0
         self.timer_job = None
@@ -781,16 +781,16 @@ class App:
 
     def build_ui(self):
         self.root.configure(bg=self.bg_color)
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=14, pady=14)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=14, pady=14)
 
-        home_tab = ttk.Frame(notebook, style="Tab.TFrame")
-        analysis_tab = ttk.Frame(notebook, style="Tab.TFrame")
-        settings_tab = ttk.Frame(notebook, style="Tab.TFrame")
+        home_tab = ttk.Frame(self.notebook, style="Tab.TFrame")
+        analysis_tab = ttk.Frame(self.notebook, style="Tab.TFrame")
+        settings_tab = ttk.Frame(self.notebook, style="Tab.TFrame")
 
-        notebook.add(home_tab, text="⌂  ホーム")
-        notebook.add(analysis_tab, text="▥  分析")
-        notebook.add(settings_tab, text="⚙  設定")
+        self.notebook.add(home_tab, text="⌂  ホーム")
+        self.notebook.add(analysis_tab, text="▥  分析")
+        self.notebook.add(settings_tab, text="⚙  設定")
 
         top_frame = ttk.Frame(home_tab, padding=(4, 4, 4, 12), style="Tab.TFrame")
         top_frame.pack(fill="x")
@@ -888,61 +888,6 @@ class App:
         device_frame.columnconfigure(0, weight=1)
         device_frame.columnconfigure(1, weight=0)
 
-        level_card, level_frame = self._card(home_tab, padx=12, pady=12)
-        level_card.pack(fill="x", pady=(0, 10))
-        ttk.Label(level_frame, text="ⓘ  録音中の入力レベル", style="Section.Card.TLabel").grid(
-            row=0,
-            column=0,
-            columnspan=3,
-            sticky="w",
-            pady=(0, 12),
-        )
-
-        ttk.Label(level_frame, text="相手音声:", style="Card.TLabel").grid(row=1, column=0, sticky="w")
-
-        self.system_level_bar = ttk.Progressbar(
-            level_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100,
-            style="Soft.Horizontal.TProgressbar"
-        )
-        self.system_level_bar.grid(row=1, column=1, padx=8, pady=5, sticky="ew")
-
-        self.system_level_label = ttk.Label(level_frame, text="0%", style="Card.TLabel")
-        self.system_level_label.grid(row=1, column=2, sticky="e")
-
-        ttk.Label(level_frame, text="マイク:", style="Card.TLabel").grid(row=2, column=0, sticky="w")
-
-        self.mic_level_bar = ttk.Progressbar(
-            level_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100,
-            style="Soft.Horizontal.TProgressbar"
-        )
-        self.mic_level_bar.grid(row=2, column=1, padx=8, pady=5, sticky="ew")
-
-        self.mic_level_label = ttk.Label(level_frame, text="0%", style="Card.TLabel")
-        self.mic_level_label.grid(row=2, column=2, sticky="e")
-
-        level_frame.columnconfigure(1, weight=1)
-
-        name_card, name_frame = self._card(home_tab, padx=12, pady=12)
-        name_card.pack(fill="x", pady=(0, 12))
-        ttk.Label(name_frame, text="任意名:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(name_frame, text="フォルダ/文字起こし名:", style="Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
-        self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
-        self.name_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self.output_name_hint = ttk.Label(
-            name_frame,
-            text="yyyy年mm月dd日hh:MM-任意名",
-            style="Muted.Card.TLabel"
-        )
-        self.output_name_hint.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(4, 0))
-        name_frame.columnconfigure(0, weight=1)
-        name_frame.columnconfigure(1, weight=1)
-
         btn_frame = ttk.Frame(home_tab, padding=(0, 0, 0, 6), style="Tab.TFrame")
         btn_frame.pack(fill="x")
 
@@ -971,6 +916,8 @@ class App:
             state="normal"
         )
         self.open_folder_btn.pack(side="left", padx=(0, 10))
+
+        self.build_recording_view()
 
         analysis_top_frame = ttk.Frame(analysis_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         analysis_top_frame.pack(fill="x")
@@ -1095,6 +1042,86 @@ class App:
             f"compute_type={self.app_settings['compute_type']}"
         )
 
+    def build_recording_view(self):
+        self.recording_frame = ttk.Frame(self.root, style="Tab.TFrame", padding=14)
+
+        self.recording_stop_btn = ttk.Button(
+            self.recording_frame,
+            text="停止",
+            style="Primary.TButton",
+            command=self.stop_recording,
+        )
+        self.recording_stop_btn.pack(anchor="w", pady=(0, 12))
+
+        levels_frame = ttk.Frame(self.recording_frame, style="Tab.TFrame")
+        levels_frame.pack(fill="x", pady=(0, 12))
+
+        system_card, system_frame = self._card(levels_frame, padx=10, pady=10)
+        system_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        ttk.Label(system_frame, text="相手音声", style="Section.Card.TLabel").pack(anchor="w")
+        self.recording_system_label = ttk.Label(
+            system_frame,
+            textvariable=self.recording_system_label_var,
+            style="Muted.Card.TLabel",
+            wraplength=170,
+            justify="left",
+        )
+        self.recording_system_label.pack(anchor="w", pady=(6, 0))
+
+        mic_card, mic_frame = self._card(levels_frame, padx=10, pady=10)
+        mic_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        ttk.Label(mic_frame, text="マイク", style="Section.Card.TLabel").pack(anchor="w")
+        self.recording_mic_label = ttk.Label(
+            mic_frame,
+            textvariable=self.recording_mic_label_var,
+            style="Muted.Card.TLabel",
+            wraplength=170,
+            justify="left",
+        )
+        self.recording_mic_label.pack(anchor="w", pady=(6, 0))
+
+        levels_frame.columnconfigure(0, weight=1)
+        levels_frame.columnconfigure(1, weight=1)
+
+        memo_card, memo_frame = self._card(self.recording_frame, padx=10, pady=10)
+        memo_card.pack(fill="both", expand=True)
+        self.memo_text = tk.Text(
+            memo_frame,
+            height=12,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            bg=self.card_color,
+            fg=self.text_color,
+            insertbackground=self.accent_color,
+            font=("Yu Gothic UI", 10),
+        )
+        self.memo_text.pack(fill="both", expand=True)
+
+    def show_recording_view(self):
+        self.notebook.pack_forget()
+        self.recording_frame.pack(fill="both", expand=True)
+
+    def show_main_view(self):
+        self.recording_frame.pack_forget()
+        self.notebook.pack(fill="both", expand=True, padx=14, pady=14)
+
+    def update_recording_device_labels(self):
+        system_name = self.system_combo.get() or "相手音声"
+        mic_name = self.mic_combo.get() or "マイク"
+        self.recording_system_label_var.set(f"{system_name}: {self.recorder.system_level}%")
+        self.recording_mic_label_var.set(f"{mic_name}: {self.recorder.mic_level}%")
+
+    def save_recording_memo(self, output_dir):
+        memo = self.memo_text.get("1.0", "end").strip()
+        if not memo:
+            return None
+
+        memo_path = Path(output_dir) / "memo.txt"
+        memo_path.write_text(memo, encoding="utf-8")
+        self.add_log(f"メモ保存: {memo_path}")
+        return memo_path
+
     def selected_model_size(self):
         selected = self.model_var.get()
         for model_size, label in MODEL_CHOICES.items():
@@ -1217,12 +1244,14 @@ class App:
             system_device_index = self.system_devices[system_pos]["index"]
             mic_device_index = self.mic_devices[mic_pos]["index"]
 
-            self.recording_session_name = self.session_name_var.get().strip()
-            self.recorder.start(system_device_index, mic_device_index, self.recording_session_name)
+            self.memo_text.delete("1.0", "end")
+            self.recorder.start(system_device_index, mic_device_index)
             self.set_lid_action_keep_running()
 
             self.status_var.set("録音中")
             self.current_transcription_var.set("文字起こし: 待機中")
+            self.update_recording_device_labels()
+            self.show_recording_view()
             self.update_recording_visual_state(is_recording=True)
             self.elapsed_seconds = 0
             self.update_timer()
@@ -1235,10 +1264,10 @@ class App:
 
             self.start_btn.config(state="disabled")
             self.stop_btn.config(state="normal")
+            self.recording_stop_btn.config(state="normal")
             self.reload_btn.config(state="disabled")
             self.system_combo.config(state="disabled")
             self.mic_combo.config(state="disabled")
-            self.name_entry.config(state="normal")
 
         except Exception as e:
             write_error_log("App.start_recording error", e)
@@ -1257,6 +1286,7 @@ class App:
         try:
             self.status_var.set("録音停止処理中")
             self.stop_btn.config(state="disabled")
+            self.recording_stop_btn.config(state="disabled")
 
             if self.timer_job:
                 self.root.after_cancel(self.timer_job)
@@ -1269,6 +1299,7 @@ class App:
             result = self.recorder.stop()
             self.restore_lid_action()
             self.update_recording_visual_state(is_recording=False)
+            self.show_main_view()
 
             self.reset_level_meter()
 
@@ -1279,6 +1310,7 @@ class App:
                 return
 
             self.last_output_dir = result["output_dir"]
+            result["memo_path"] = self.save_recording_memo(result["output_dir"])
 
             self.enqueue_transcription_job(result)
             self.add_log("録音停止後に文字起こしキューへ追加しました。文字起こし開始ボタンを押してください。")
@@ -1296,6 +1328,7 @@ class App:
                 f"録音停止に失敗しました。\n\n{e}\n\n詳細は {ERROR_LOG} を確認してください。"
             )
             self.update_recording_visual_state(is_recording=False)
+            self.show_main_view()
             self.restore_lid_action()
 
     def run_transcription(self, result, notify=True):
@@ -1313,7 +1346,15 @@ class App:
             )
 
             all_rows = system_rows + mic_rows
-            self.transcriber.export_transcript(all_rows, result["txt_out"])
+            memo_path = result.get("memo_path")
+            memo_text = ""
+            if memo_path and Path(memo_path).exists():
+                memo_text = Path(memo_path).read_text(encoding="utf-8")
+
+            self.transcriber.export_transcript(all_rows, result["txt_out"], memo_text=memo_text)
+            if memo_path and Path(memo_path).exists():
+                Path(memo_path).unlink()
+                self.add_log(f"メモ一時ファイル削除: {memo_path}")
 
             self.add_log("文字起こしが完了しました。")
             self.add_log(f"保存フォルダ: {result['output_dir']}")
@@ -1367,6 +1408,7 @@ class App:
             "system_wav": folder / "system.wav",
             "mic_wav": folder / "mic.wav",
             "txt_out": folder / f"{folder.name}.txt",
+            "memo_path": folder / "memo.txt",
         }
         if not job["system_wav"].exists() or not job["mic_wav"].exists():
             safe_messagebox_error("エラー", "system.wav と mic.wav が見つかりません。")
@@ -1445,6 +1487,7 @@ class App:
     def enable_controls(self):
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.recording_stop_btn.config(state="normal")
         self.reload_btn.config(state="normal")
         self.system_combo.config(state="readonly")
         self.mic_combo.config(state="readonly")
@@ -1600,19 +1643,17 @@ class App:
         system_level = self.recorder.system_level
         mic_level = self.recorder.mic_level
 
-        self.system_level_bar["value"] = system_level
-        self.mic_level_bar["value"] = mic_level
-
-        self.system_level_label.config(text=f"{system_level}%")
-        self.mic_level_label.config(text=f"{mic_level}%")
+        if self.recorder.is_recording:
+            system_name = self.system_combo.get() or "相手音声"
+            mic_name = self.mic_combo.get() or "マイク"
+            self.recording_system_label_var.set(f"{system_name}: {system_level}%")
+            self.recording_mic_label_var.set(f"{mic_name}: {mic_level}%")
 
         self.level_job = self.root.after(100, self.update_level_meter)
 
     def reset_level_meter(self):
-        self.system_level_bar["value"] = 0
-        self.mic_level_bar["value"] = 0
-        self.system_level_label.config(text="0%")
-        self.mic_level_label.config(text="0%")
+        self.recording_system_label_var.set("相手音声: 0%")
+        self.recording_mic_label_var.set("マイク: 0%")
 
     def update_recording_visual_state(self, is_recording):
         if is_recording:
