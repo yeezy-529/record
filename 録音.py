@@ -640,6 +640,9 @@ class App:
 
         self.status_var = tk.StringVar(value="起動中")
         self.timer_var = tk.StringVar(value="録音時間: 00:00")
+        self.status_title_var = tk.StringVar(value="停止中")
+        self.status_detail_var = tk.StringVar(value="録音は開始されていません")
+        self.current_transcription_var = tk.StringVar(value="文字起こし: 待機中")
         self.session_name_var = tk.StringVar(value="")
         self.recording_session_name = ""
 
@@ -657,6 +660,7 @@ class App:
         self.transcription_queue = []
         self.transcription_running = False
         self.default_bg = self.root.cget("bg")
+        self.status_var.trace_add("write", lambda *_: self.refresh_status_banner())
 
         self.build_ui()
         self.update_recording_visual_state(is_recording=False)
@@ -703,6 +707,49 @@ class App:
             "録音停止後、文字起こしのみを txt 保存します。"
         )
         ttk.Label(top_frame, text=desc, foreground=self.muted_color).pack(anchor="w", pady=(6, 0))
+
+        self.status_banner = tk.Frame(
+            top_frame,
+            bg="#ffffff",
+            highlightthickness=1,
+            highlightbackground="#f4d9e2",
+            highlightcolor="#f4d9e2",
+        )
+        self.status_banner.pack(fill="x", pady=(14, 0))
+        self.status_title_label = tk.Label(
+            self.status_banner,
+            textvariable=self.status_title_var,
+            bg="#ffffff",
+            fg=self.text_color,
+            font=("Yu Gothic UI", 15, "bold"),
+            anchor="w",
+            padx=14,
+            pady=8,
+        )
+        self.status_title_label.pack(fill="x")
+        self.status_detail_label = tk.Label(
+            self.status_banner,
+            textvariable=self.status_detail_var,
+            bg="#ffffff",
+            fg=self.muted_color,
+            font=("Yu Gothic UI", 9),
+            anchor="w",
+            padx=14,
+            pady=6,
+        )
+        self.status_detail_label.pack(fill="x")
+        self.current_transcription_label = tk.Label(
+            self.status_banner,
+            textvariable=self.current_transcription_var,
+            bg="#ffffff",
+            fg=self.muted_color,
+            font=("Yu Gothic UI", 8),
+            anchor="w",
+            padx=14,
+            pady=6,
+        )
+        self.current_transcription_label.pack(fill="x")
+        self.refresh_status_banner()
 
         device_card, device_frame = self._card(home_tab)
         device_card.pack(fill="x", pady=(0, 10))
@@ -1016,6 +1063,7 @@ class App:
             self.set_lid_action_keep_running()
 
             self.status_var.set("録音中")
+            self.current_transcription_var.set("文字起こし: 待機中")
             self.update_recording_visual_state(is_recording=True)
             self.elapsed_seconds = 0
             self.update_timer()
@@ -1091,7 +1139,8 @@ class App:
 
     def run_transcription(self, result, notify=True):
         try:
-            self.root.after(0, lambda: self.status_var.set(f"文字起こし中: {Path(result['output_dir']).name}"))
+            job_name = Path(result["output_dir"]).name
+            self.root.after(0, lambda name=job_name: self.set_transcription_status(name))
             system_rows = self.transcriber.transcribe_file(
                 result["system_wav"],
                 "相手"
@@ -1108,7 +1157,8 @@ class App:
             self.add_log("文字起こしが完了しました。")
             self.add_log(f"保存フォルダ: {result['output_dir']}")
 
-            self.status_var.set("完了")
+            self.root.after(0, lambda: self.status_var.set("完了"))
+            self.root.after(0, lambda: self.current_transcription_var.set("文字起こし: 完了"))
             if notify:
                 safe_messagebox_info(
                     "完了",
@@ -1118,7 +1168,8 @@ class App:
 
         except Exception as e:
             write_error_log("App.run_transcription error", e)
-            self.status_var.set("エラー")
+            self.root.after(0, lambda: self.status_var.set("エラー"))
+            self.root.after(0, lambda: self.current_transcription_var.set("文字起こし: エラー"))
             self.add_log(f"文字起こしエラー: {e}")
             safe_messagebox_error(
                 "エラー",
@@ -1140,6 +1191,11 @@ class App:
             self.queue_listbox.insert("end", f"{idx}. {item['output_dir']}")
         if hasattr(self, "queue_count_label"):
             self.queue_count_label.config(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
+
+    def set_transcription_status(self, job_name):
+        self.current_transcription_var.set(f"文字起こし: {job_name}")
+        self.status_var.set(f"文字起こし中: {job_name}")
+        self.refresh_status_banner()
 
     def add_queue_from_dialog(self):
         folder = filedialog.askdirectory(title="文字起こし対象フォルダを選択")
@@ -1171,6 +1227,7 @@ class App:
             return
         if not self.transcription_queue:
             self.add_log("文字起こしキューが空です。")
+            self.current_transcription_var.set("文字起こし: キューが空です")
             return
         self.transcription_running = True
         self.status_var.set("文字起こしキュー実行中")
@@ -1192,6 +1249,7 @@ class App:
         finally:
             self.transcription_running = False
             self.root.after(0, lambda: self.status_var.set("待機中"))
+            self.root.after(0, lambda: self.current_transcription_var.set("文字起こし: 待機中"))
 
     def open_output_folder(self):
         folder = self.last_output_dir or BASE_DIR
@@ -1381,6 +1439,7 @@ class App:
         seconds = self.elapsed_seconds % 60
 
         self.timer_var.set(f"録音時間: {minutes:02d}:{seconds:02d}")
+        self.refresh_status_banner()
 
         self.elapsed_seconds += 1
         self.timer_job = self.root.after(1000, self.update_timer)
@@ -1417,7 +1476,55 @@ class App:
 
         self.root.configure(bg=bg)
         self.root.title(title)
+        self.refresh_status_banner()
         self._flash_taskbar_once()
+
+    def refresh_status_banner(self):
+        if not hasattr(self, "status_banner"):
+            return
+
+        status = self.status_var.get()
+        if "録音中" in status:
+            bg = self.accent_color
+            title_fg = "#ffffff"
+            detail_fg = "#ffffff"
+            self.status_title_var.set("● 録音中")
+            self.status_detail_var.set(self.timer_var.get())
+        elif "文字起こし中" in status or self.transcription_running:
+            bg = "#fff0f5"
+            title_fg = self.accent_color
+            detail_fg = self.text_color
+            self.status_title_var.set("文字起こし中")
+            self.status_detail_var.set("録音データを txt に変換しています")
+        elif "エラー" in status:
+            bg = "#fff1f2"
+            title_fg = "#be123c"
+            detail_fg = "#be123c"
+            self.status_title_var.set("エラー")
+            self.status_detail_var.set("詳細はログを確認してください")
+        elif "デバイス" in status:
+            bg = "#ffffff"
+            title_fg = self.text_color
+            detail_fg = self.muted_color
+            self.status_title_var.set(status)
+            self.status_detail_var.set("録音デバイスの状態を確認しています")
+        else:
+            bg = "#ffffff"
+            title_fg = self.text_color
+            detail_fg = self.muted_color
+            self.status_title_var.set("停止中")
+            self.status_detail_var.set("録音は開始されていません")
+
+        for widget in (
+            self.status_banner,
+            self.status_title_label,
+            self.status_detail_label,
+            self.current_transcription_label,
+        ):
+            widget.configure(bg=bg)
+        self.status_title_label.configure(fg=title_fg)
+        self.status_detail_label.configure(fg=detail_fg)
+        self.current_transcription_label.configure(fg=detail_fg)
 
     def _flash_taskbar_once(self):
         if os.name != "nt":
