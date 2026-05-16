@@ -599,11 +599,36 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("900x680")
+        self.root.geometry("430x720")
+        self.root.minsize(400, 640)
+        self.bg_color = "#fff8fb"
+        self.card_color = "#ffffff"
+        self.text_color = "#1f2937"
+        self.muted_color = "#6b7280"
+        self.accent_color = "#ff5c8a"
+        self.accent_soft = "#ffe7ef"
+        self.border_color = "#f8cdd9"
         self.style = ttk.Style()
         self.style.theme_use("clam")
-        self.style.configure("TNotebook.Tab", padding=(20, 10), font=("Yu Gothic UI", 10, "bold"))
-        self.style.configure("Tab.TFrame", background="#f3f4f6")
+        self.style.configure("TNotebook", background=self.bg_color, borderwidth=0)
+        self.style.configure("TNotebook.Tab", padding=(26, 11), font=("Yu Gothic UI", 9), borderwidth=0)
+        self.style.map(
+            "TNotebook.Tab",
+            foreground=[("selected", self.accent_color), ("!selected", self.text_color)],
+            background=[("selected", "#fff0f5"), ("!selected", "#ffffff")],
+        )
+        self.style.configure("Tab.TFrame", background=self.bg_color)
+        self.style.configure("TFrame", background=self.bg_color)
+        self.style.configure("Card.TFrame", background=self.card_color)
+        self.style.configure("TLabel", background=self.bg_color, foreground=self.text_color, font=("Yu Gothic UI", 9))
+        self.style.configure("Card.TLabel", background=self.card_color, foreground=self.text_color, font=("Yu Gothic UI", 9))
+        self.style.configure("Muted.Card.TLabel", background=self.card_color, foreground=self.muted_color, font=("Yu Gothic UI", 8))
+        self.style.configure("Title.TLabel", background=self.bg_color, foreground=self.text_color, font=("Yu Gothic UI", 15, "bold"))
+        self.style.configure("Section.Card.TLabel", background=self.card_color, foreground=self.text_color, font=("Yu Gothic UI", 10, "bold"))
+        self.style.configure("Accent.TButton", foreground=self.accent_color, font=("Yu Gothic UI", 9, "bold"), padding=(14, 8))
+        self.style.configure("Primary.TButton", foreground="#ffffff", background=self.accent_color, font=("Yu Gothic UI", 9, "bold"), padding=(14, 9))
+        self.style.map("Primary.TButton", background=[("active", "#ff477d"), ("disabled", "#f3c4d1")])
+        self.style.configure("Soft.Horizontal.TProgressbar", troughcolor="#ffe6ee", background=self.accent_color, bordercolor="#ffe6ee", lightcolor=self.accent_color, darkcolor=self.accent_color)
 
         self.main_thread_id = threading.get_ident()
 
@@ -638,38 +663,59 @@ class App:
 
         self.root.after(100, self.load_devices)
 
+    def _card(self, parent, padx=14, pady=14):
+        card = tk.Frame(
+            parent,
+            bg=self.card_color,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#f4d9e2",
+            highlightcolor="#f4d9e2",
+        )
+        inner = ttk.Frame(card, style="Card.TFrame", padding=(padx, pady))
+        inner.pack(fill="both", expand=True)
+        return card, inner
+
     def build_ui(self):
+        self.root.configure(bg=self.bg_color)
         notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=20, pady=20)
+        notebook.pack(fill="both", expand=True, padx=14, pady=14)
 
         home_tab = ttk.Frame(notebook, style="Tab.TFrame")
         analysis_tab = ttk.Frame(notebook, style="Tab.TFrame")
         settings_tab = ttk.Frame(notebook, style="Tab.TFrame")
 
-        notebook.add(home_tab, text="ホーム")
-        notebook.add(analysis_tab, text="分析")
-        notebook.add(settings_tab, text="設定")
+        notebook.add(home_tab, text="⌂  ホーム")
+        notebook.add(analysis_tab, text="▥  分析")
+        notebook.add(settings_tab, text="⚙  設定")
 
-        top_frame = ttk.Frame(home_tab, padding=12)
+        top_frame = ttk.Frame(home_tab, padding=(4, 18, 4, 12), style="Tab.TFrame")
         top_frame.pack(fill="x")
 
         ttk.Label(
             top_frame,
             text="文字起こしレコーダー",
-            font=("Yu Gothic UI", 16, "bold")
+            style="Title.TLabel"
         ).pack(anchor="w")
 
         desc = (
             "録音開始時だけ音声デバイスを開きます。\n"
             "録音停止後、文字起こしのみを txt 保存します。"
         )
-        ttk.Label(top_frame, text=desc).pack(anchor="w", pady=(6, 10))
+        ttk.Label(top_frame, text=desc, foreground=self.muted_color).pack(anchor="w", pady=(6, 0))
 
-        device_frame = ttk.LabelFrame(home_tab, text="録音デバイス選択", padding=12)
-        device_frame.pack(fill="x", padx=12, pady=(0, 8))
-
-        ttk.Label(device_frame, text="スピーカー / 相手音声:").grid(
+        device_card, device_frame = self._card(home_tab)
+        device_card.pack(fill="x", pady=(0, 10))
+        ttk.Label(device_frame, text="🎙  録音デバイス選択", style="Section.Card.TLabel").grid(
             row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 12),
+        )
+
+        ttk.Label(device_frame, text="スピーカー / 相手音声:", style="Card.TLabel").grid(
+            row=1,
             column=0,
             sticky="w"
         )
@@ -679,10 +725,10 @@ class App:
             state="readonly",
             width=80
         )
-        self.system_combo.grid(row=0, column=1, padx=8, pady=4, sticky="ew")
+        self.system_combo.grid(row=2, column=0, columnspan=2, pady=(4, 10), sticky="ew")
 
-        ttk.Label(device_frame, text="マイク / 自分の声:").grid(
-            row=1,
+        ttk.Label(device_frame, text="マイク / 自分の声:", style="Card.TLabel").grid(
+            row=3,
             column=0,
             sticky="w"
         )
@@ -692,77 +738,93 @@ class App:
             state="readonly",
             width=80
         )
-        self.mic_combo.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
+        self.mic_combo.grid(row=4, column=0, columnspan=2, pady=(4, 10), sticky="ew")
 
         self.system_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
         self.mic_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
 
         self.reload_btn = ttk.Button(
             device_frame,
-            text="デバイス再読み込み",
+            text="⟳  デバイス再読み込み",
+            style="Accent.TButton",
             command=self.load_devices
         )
-        self.reload_btn.grid(row=2, column=1, sticky="e", pady=(8, 0))
+        self.reload_btn.grid(row=5, column=1, sticky="e", pady=(2, 0))
 
-        device_frame.columnconfigure(1, weight=1)
+        device_frame.columnconfigure(0, weight=1)
+        device_frame.columnconfigure(1, weight=0)
 
-        status_frame = ttk.Frame(home_tab, padding=(12, 0))
-        status_frame.pack(fill="x")
+        status_card, status_frame = self._card(home_tab, padx=12, pady=12)
+        status_card.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(status_frame, text="状態:").pack(side="left")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(
-            side="left",
-            padx=(4, 24)
-        )
-        ttk.Label(status_frame, textvariable=self.timer_var).pack(side="left")
+        top_status = ttk.Frame(status_frame, style="Card.TFrame")
+        top_status.pack(fill="x")
+        ttk.Label(top_status, text="状態:", style="Card.TLabel").pack(side="left")
+        ttk.Label(top_status, textvariable=self.status_var, foreground=self.accent_color, style="Card.TLabel").pack(side="left", padx=(4, 24))
+        ttk.Label(top_status, textvariable=self.timer_var, style="Card.TLabel").pack(side="left")
 
-        name_frame = ttk.Frame(home_tab, padding=(12, 4))
-        name_frame.pack(fill="x")
-        ttk.Label(name_frame, text="任意名:").pack(side="left")
+        name_frame = ttk.Frame(status_frame, style="Card.TFrame")
+        name_frame.pack(fill="x", pady=(12, 0))
+        ttk.Label(name_frame, text="任意名:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(name_frame, text="フォルダ/文字起こし名:", style="Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
         self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
-        self.name_entry.pack(side="left", padx=(6, 8))
-        ttk.Label(
+        self.name_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.output_name_hint = ttk.Label(
             name_frame,
-            text="フォルダ/文字起こし名: yyyy年mm月dd日hh:MM-任意名（録音停止で確定）"
-        ).pack(side="left")
+            text="yyyy年mm月dd日hh:MM-任意名",
+            style="Muted.Card.TLabel"
+        )
+        self.output_name_hint.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(4, 0))
+        name_frame.columnconfigure(0, weight=1)
+        name_frame.columnconfigure(1, weight=1)
 
-        level_frame = ttk.LabelFrame(home_tab, text="録音中の入力レベル", padding=12)
-        level_frame.pack(fill="x", padx=12, pady=(8, 0))
+        level_card, level_frame = self._card(home_tab, padx=12, pady=12)
+        level_card.pack(fill="x", pady=(0, 12))
+        ttk.Label(level_frame, text="ⓘ  録音中の入力レベル", style="Section.Card.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=3,
+            sticky="w",
+            pady=(0, 12),
+        )
 
-        ttk.Label(level_frame, text="相手音声:").grid(row=0, column=0, sticky="w")
+        ttk.Label(level_frame, text="相手音声:", style="Card.TLabel").grid(row=1, column=0, sticky="w")
 
         self.system_level_bar = ttk.Progressbar(
             level_frame,
             orient="horizontal",
             mode="determinate",
-            maximum=100
+            maximum=100,
+            style="Soft.Horizontal.TProgressbar"
         )
-        self.system_level_bar.grid(row=0, column=1, padx=8, pady=4, sticky="ew")
+        self.system_level_bar.grid(row=1, column=1, padx=8, pady=5, sticky="ew")
 
-        self.system_level_label = ttk.Label(level_frame, text="0%")
-        self.system_level_label.grid(row=0, column=2, sticky="e")
+        self.system_level_label = ttk.Label(level_frame, text="0%", style="Card.TLabel")
+        self.system_level_label.grid(row=1, column=2, sticky="e")
 
-        ttk.Label(level_frame, text="マイク:").grid(row=1, column=0, sticky="w")
+        ttk.Label(level_frame, text="マイク:", style="Card.TLabel").grid(row=2, column=0, sticky="w")
 
         self.mic_level_bar = ttk.Progressbar(
             level_frame,
             orient="horizontal",
             mode="determinate",
-            maximum=100
+            maximum=100,
+            style="Soft.Horizontal.TProgressbar"
         )
-        self.mic_level_bar.grid(row=1, column=1, padx=8, pady=4, sticky="ew")
+        self.mic_level_bar.grid(row=2, column=1, padx=8, pady=5, sticky="ew")
 
-        self.mic_level_label = ttk.Label(level_frame, text="0%")
-        self.mic_level_label.grid(row=1, column=2, sticky="e")
+        self.mic_level_label = ttk.Label(level_frame, text="0%", style="Card.TLabel")
+        self.mic_level_label.grid(row=2, column=2, sticky="e")
 
         level_frame.columnconfigure(1, weight=1)
 
-        btn_frame = ttk.Frame(home_tab, padding=12)
+        btn_frame = ttk.Frame(home_tab, padding=(0, 0, 0, 6), style="Tab.TFrame")
         btn_frame.pack(fill="x")
 
         self.start_btn = ttk.Button(
             btn_frame,
-            text="録音開始",
+            text="◎  録音開始",
+            style="Primary.TButton",
             command=self.start_recording,
             state="disabled"
         )
@@ -770,7 +832,7 @@ class App:
 
         self.stop_btn = ttk.Button(
             btn_frame,
-            text="録音停止",
+            text="◉  録音停止",
             command=self.stop_recording,
             state="disabled"
         )
@@ -778,54 +840,98 @@ class App:
 
         self.open_folder_btn = ttk.Button(
             btn_frame,
-            text="録音フォルダを開く",
+            text="□  録音フォルダを開く",
+            style="Accent.TButton",
             command=self.open_output_folder,
             state="normal"
         )
         self.open_folder_btn.pack(side="left", padx=(0, 10))
 
-        analysis_top_frame = ttk.Frame(analysis_tab, padding=(12, 12, 12, 0))
+        analysis_top_frame = ttk.Frame(analysis_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         analysis_top_frame.pack(fill="x")
         self.start_transcribe_btn = ttk.Button(
             analysis_top_frame,
-            text="文字起こし開始",
+            text="✐  文字起こし開始",
+            style="Accent.TButton",
             command=self.start_transcription_queue,
             state="normal"
         )
         self.start_transcribe_btn.pack(side="left")
 
-        queue_frame = ttk.LabelFrame(analysis_tab, text="文字起こしキュー", padding=12)
-        queue_frame.pack(fill="both", expand=False, padx=12, pady=(0, 8))
+        ttk.Label(analysis_tab, text="文字起こしキュー", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
+        queue_card, queue_frame = self._card(analysis_tab, padx=12, pady=12)
+        queue_card.pack(fill="x", pady=(0, 10))
 
-        self.queue_listbox = tk.Listbox(queue_frame, height=6)
-        self.queue_listbox.pack(fill="x", expand=True)
+        drop_area = tk.Frame(
+            queue_frame,
+            bg="#fffafa",
+            highlightthickness=1,
+            highlightbackground=self.border_color,
+            height=150,
+        )
+        drop_area.pack(fill="x")
+        drop_area.pack_propagate(False)
+        tk.Label(drop_area, text="▣", bg="#fffafa", fg=self.accent_color, font=("Yu Gothic UI", 28, "bold")).pack(pady=(30, 6))
+        tk.Label(drop_area, text="ここに txt 対象フォルダを追加", bg="#fffafa", fg=self.text_color, font=("Yu Gothic UI", 9, "bold")).pack()
+        tk.Label(drop_area, text="下のボタンから選択してください", bg="#fffafa", fg=self.muted_color, font=("Yu Gothic UI", 8)).pack(pady=(6, 0))
 
-        queue_btn_frame = ttk.Frame(queue_frame)
-        queue_btn_frame.pack(fill="x", pady=(8, 0))
+        queue_btn_frame = ttk.Frame(analysis_tab, style="Tab.TFrame")
+        queue_btn_frame.pack(fill="x", pady=(0, 14))
         ttk.Button(
             queue_btn_frame,
-            text="フォルダ追加",
+            text="+  フォルダ追加",
+            style="Primary.TButton",
             command=self.add_queue_from_dialog
         ).pack(side="left")
         ttk.Button(
             queue_btn_frame,
-            text="選択削除",
+            text="♲  選択削除",
             command=self.remove_selected_queue
         ).pack(side="left", padx=(8, 0))
 
-        settings_top_frame = ttk.Frame(settings_tab, padding=(12, 12, 12, 0))
+        self.queue_count_label = ttk.Label(analysis_tab, text="追加済みファイル（0 件）", font=("Yu Gothic UI", 10, "bold"))
+        self.queue_count_label.pack(anchor="w", padx=4, pady=(0, 8))
+        list_card, list_frame = self._card(analysis_tab, padx=12, pady=12)
+        list_card.pack(fill="both", expand=True, pady=(0, 0))
+        self.queue_listbox = tk.Listbox(
+            list_frame,
+            height=8,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            bg=self.card_color,
+            fg=self.text_color,
+            selectbackground=self.accent_soft,
+            selectforeground=self.text_color,
+            font=("Yu Gothic UI", 9),
+        )
+        self.queue_listbox.pack(fill="both", expand=True)
+
+        settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         settings_top_frame.pack(fill="x")
         self.open_error_btn = ttk.Button(
             settings_top_frame,
-            text="エラーログを開く",
+            text="▤  エラーログを開く",
+            style="Accent.TButton",
             command=self.open_error_log
         )
         self.open_error_btn.pack(side="left")
 
-        log_frame = ttk.LabelFrame(settings_tab, text="ログ", padding=12)
-        log_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(settings_tab, text="ログ", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
+        log_card, log_frame = self._card(settings_tab, padx=12, pady=12)
+        log_card.pack(fill="both", expand=True, pady=(0, 0))
 
-        self.log_text = tk.Text(log_frame, height=20, wrap="word")
+        self.log_text = tk.Text(
+            log_frame,
+            height=20,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            bg=self.card_color,
+            fg=self.text_color,
+            insertbackground=self.accent_color,
+            font=("Yu Gothic UI", 9),
+        )
         self.log_text.pack(fill="both", expand=True)
 
         self.add_log("アプリを起動しました。")
@@ -1032,6 +1138,8 @@ class App:
         self.queue_listbox.delete(0, "end")
         for idx, item in enumerate(self.transcription_queue, start=1):
             self.queue_listbox.insert("end", f"{idx}. {item['output_dir']}")
+        if hasattr(self, "queue_count_label"):
+            self.queue_count_label.config(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
 
     def add_queue_from_dialog(self):
         folder = filedialog.askdirectory(title="文字起こし対象フォルダを選択")
@@ -1301,10 +1409,10 @@ class App:
 
     def update_recording_visual_state(self, is_recording):
         if is_recording:
-            bg = self.default_bg
+            bg = self.bg_color
             title = f"{APP_TITLE} ● 録音中"
         else:
-            bg = "#FFB6C1"
+            bg = self.bg_color
             title = f"{APP_TITLE} ■ 停止中"
 
         self.root.configure(bg=bg)
