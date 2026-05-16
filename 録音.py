@@ -600,6 +600,10 @@ class App:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("900x680")
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
+        self.style.configure("TNotebook.Tab", padding=(20, 10), font=("Yu Gothic UI", 10, "bold"))
+        self.style.configure("Tab.TFrame", background="#f3f4f6")
 
         self.main_thread_id = threading.get_ident()
 
@@ -635,7 +639,18 @@ class App:
         self.root.after(100, self.load_devices)
 
     def build_ui(self):
-        top_frame = ttk.Frame(self.root, padding=12)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, padx=20, pady=20)
+
+        home_tab = ttk.Frame(notebook, style="Tab.TFrame")
+        analysis_tab = ttk.Frame(notebook, style="Tab.TFrame")
+        settings_tab = ttk.Frame(notebook, style="Tab.TFrame")
+
+        notebook.add(home_tab, text="ホーム")
+        notebook.add(analysis_tab, text="分析")
+        notebook.add(settings_tab, text="設定")
+
+        top_frame = ttk.Frame(home_tab, padding=12)
         top_frame.pack(fill="x")
 
         ttk.Label(
@@ -650,7 +665,7 @@ class App:
         )
         ttk.Label(top_frame, text=desc).pack(anchor="w", pady=(6, 10))
 
-        device_frame = ttk.LabelFrame(self.root, text="録音デバイス選択", padding=12)
+        device_frame = ttk.LabelFrame(home_tab, text="録音デバイス選択", padding=12)
         device_frame.pack(fill="x", padx=12, pady=(0, 8))
 
         ttk.Label(device_frame, text="スピーカー / 相手音声:").grid(
@@ -691,7 +706,7 @@ class App:
 
         device_frame.columnconfigure(1, weight=1)
 
-        status_frame = ttk.Frame(self.root, padding=(12, 0))
+        status_frame = ttk.Frame(home_tab, padding=(12, 0))
         status_frame.pack(fill="x")
 
         ttk.Label(status_frame, text="状態:").pack(side="left")
@@ -701,7 +716,7 @@ class App:
         )
         ttk.Label(status_frame, textvariable=self.timer_var).pack(side="left")
 
-        name_frame = ttk.Frame(self.root, padding=(12, 4))
+        name_frame = ttk.Frame(home_tab, padding=(12, 4))
         name_frame.pack(fill="x")
         ttk.Label(name_frame, text="任意名:").pack(side="left")
         self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
@@ -711,7 +726,7 @@ class App:
             text="フォルダ/文字起こし名: yyyy年mm月dd日hh:MM-任意名（録音停止で確定）"
         ).pack(side="left")
 
-        level_frame = ttk.LabelFrame(self.root, text="録音中の入力レベル", padding=12)
+        level_frame = ttk.LabelFrame(home_tab, text="録音中の入力レベル", padding=12)
         level_frame.pack(fill="x", padx=12, pady=(8, 0))
 
         ttk.Label(level_frame, text="相手音声:").grid(row=0, column=0, sticky="w")
@@ -742,7 +757,7 @@ class App:
 
         level_frame.columnconfigure(1, weight=1)
 
-        btn_frame = ttk.Frame(self.root, padding=12)
+        btn_frame = ttk.Frame(home_tab, padding=12)
         btn_frame.pack(fill="x")
 
         self.start_btn = ttk.Button(
@@ -769,22 +784,17 @@ class App:
         )
         self.open_folder_btn.pack(side="left", padx=(0, 10))
 
-        self.open_error_btn = ttk.Button(
-            btn_frame,
-            text="エラーログを開く",
-            command=self.open_error_log
-        )
-        self.open_error_btn.pack(side="left")
-
+        analysis_top_frame = ttk.Frame(analysis_tab, padding=(12, 12, 12, 0))
+        analysis_top_frame.pack(fill="x")
         self.start_transcribe_btn = ttk.Button(
-            btn_frame,
+            analysis_top_frame,
             text="文字起こし開始",
             command=self.start_transcription_queue,
             state="normal"
         )
-        self.start_transcribe_btn.pack(side="left", padx=(10, 0))
+        self.start_transcribe_btn.pack(side="left")
 
-        queue_frame = ttk.LabelFrame(self.root, text="文字起こしキュー", padding=12)
+        queue_frame = ttk.LabelFrame(analysis_tab, text="文字起こしキュー", padding=12)
         queue_frame.pack(fill="both", expand=False, padx=12, pady=(0, 8))
 
         self.queue_listbox = tk.Listbox(queue_frame, height=6)
@@ -803,7 +813,16 @@ class App:
             command=self.remove_selected_queue
         ).pack(side="left", padx=(8, 0))
 
-        log_frame = ttk.LabelFrame(self.root, text="ログ", padding=12)
+        settings_top_frame = ttk.Frame(settings_tab, padding=(12, 12, 12, 0))
+        settings_top_frame.pack(fill="x")
+        self.open_error_btn = ttk.Button(
+            settings_top_frame,
+            text="エラーログを開く",
+            command=self.open_error_log
+        )
+        self.open_error_btn.pack(side="left")
+
+        log_frame = ttk.LabelFrame(settings_tab, text="ログ", padding=12)
         log_frame.pack(fill="both", expand=True, padx=12, pady=12)
 
         self.log_text = tk.Text(log_frame, height=20, wrap="word")
