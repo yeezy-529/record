@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import re
+import audioop
 import struct
 import threading
 import subprocess
@@ -129,6 +130,7 @@ class AudioRecorder:
         self.output_dir = None
         self.system_wav = None
         self.mic_wav = None
+        self.mixed_wav = None
         self.txt_out = None
 
     @staticmethod
@@ -326,6 +328,7 @@ class AudioRecorder:
 
             self.system_wav = self.output_dir / "system.wav"
             self.mic_wav = self.output_dir / "mic.wav"
+            self.mixed_wav = self.output_dir / "mixed.wav"
             self.txt_out = self.output_dir / f"{folder_name}.txt"
 
             self.system_frames = []
@@ -513,10 +516,31 @@ class AudioRecorder:
                 else:
                     self.log("マイク音声は保存データがありませんでした。")
 
+                mixed_wav = None
+                if system_frames and mic_frames:
+                    try:
+                        self._save_mixed_wav(
+                            self.mixed_wav,
+                            system_frames,
+                            self.system_channels,
+                            self.system_rate,
+                            mic_frames,
+                            self.mic_channels,
+                            self.mic_rate,
+                        )
+                        mixed_wav = self.mixed_wav
+                        self.log(f"MIX音声保存: {self.mixed_wav}")
+                    except Exception as e:
+                        write_error_log("AudioRecorder.stop mixed wav error", e)
+                        self.log(f"MIX音声保存失敗: {e}")
+                else:
+                    self.log("MIX音声は作成しませんでした。")
+
                 result = {
                     "output_dir": self.output_dir,
                     "system_wav": self.system_wav,
                     "mic_wav": self.mic_wav,
+                    "mixed_wav": mixed_wav,
                     "txt_out": self.txt_out,
                 }
 
@@ -565,6 +589,45 @@ class AudioRecorder:
 
         finally:
             p.terminate()
+
+    @staticmethod
+    def _frames_to_mono_pcm(frames, channels, rate, target_rate):
+        pcm = b"".join(frames)
+        sample_width = 2
+
+        if channels > 1:
+            weights = [1 / channels] * channels
+            pcm = audioop.tomono(pcm, sample_width, weights[0], weights[1] if channels > 1 else weights[0])
+
+        if rate != target_rate:
+            pcm, _ = audioop.ratecv(pcm, sample_width, 1, rate, target_rate, None)
+
+        return audioop.mul(pcm, sample_width, 0.7)
+
+    def _save_mixed_wav(
+        self,
+        path,
+        system_frames,
+        system_channels,
+        system_rate,
+        mic_frames,
+        mic_channels,
+        mic_rate,
+    ):
+        target_rate = system_rate
+        system_pcm = self._frames_to_mono_pcm(system_frames, system_channels, system_rate, target_rate)
+        mic_pcm = self._frames_to_mono_pcm(mic_frames, mic_channels, mic_rate, target_rate)
+
+        max_len = max(len(system_pcm), len(mic_pcm))
+        system_pcm = system_pcm.ljust(max_len, b"\x00")
+        mic_pcm = mic_pcm.ljust(max_len, b"\x00")
+        mixed_pcm = audioop.add(system_pcm, mic_pcm, 2)
+
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(target_rate)
+            wf.writeframes(mixed_pcm)
 
 
 # =========================
