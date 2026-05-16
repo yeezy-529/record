@@ -1,6 +1,7 @@
 import math
 import os
 import sys
+import json
 import struct
 import threading
 import subprocess
@@ -25,14 +26,35 @@ BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 ERROR_LOG = BASE_DIR / "error_log.txt"
+SETTINGS_FILE = BASE_DIR / "app_settings.json"
 
 FORMAT = pyaudio.paInt16
 CHUNK = 2048
 LANGUAGE = "ja"
 
-MODEL_SIZE = "medium"
+MODEL_SIZE = "large-v3"
 COMPUTE_TYPE = "int8"
+BEAM_SIZE = 5
 LIDCLOSE_GUID = "5ca83367-6e45-459f-a27b-476b1d01c936"
+
+MODEL_CHOICES = {
+    "medium": "medium（標準・軽め）",
+    "large-v3": "large-v3（高精度・推奨）",
+    "large-v3-turbo": "large-v3-turbo（高速）",
+}
+
+MODE_CHOICES = {
+    "高速": 1,
+    "標準": 5,
+    "高精度": 10,
+}
+
+DEFAULT_SETTINGS = {
+    "model_size": MODEL_SIZE,
+    "mode": "標準",
+    "beam_size": BEAM_SIZE,
+    "compute_type": COMPUTE_TYPE,
+}
 
 
 def ensure_error_log():
@@ -77,6 +99,32 @@ def safe_messagebox_info(title, message):
 
 def safe_messagebox_error(title, message):
     _safe_messagebox(messagebox.showerror, title, message)
+
+
+def load_app_settings():
+    settings = DEFAULT_SETTINGS.copy()
+    try:
+        if SETTINGS_FILE.exists():
+            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                settings.update(loaded)
+    except Exception as e:
+        write_error_log("load_app_settings error", e)
+
+    if settings.get("model_size") not in MODEL_CHOICES:
+        settings["model_size"] = DEFAULT_SETTINGS["model_size"]
+    if settings.get("mode") not in MODE_CHOICES:
+        settings["mode"] = DEFAULT_SETTINGS["mode"]
+    settings["beam_size"] = MODE_CHOICES[settings["mode"]]
+    settings["compute_type"] = COMPUTE_TYPE
+    return settings
+
+
+def save_app_settings(settings):
+    SETTINGS_FILE.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 # =========================
@@ -500,7 +548,20 @@ class Transcriber:
     def __init__(self, log_func):
         self.log = log_func
         self.model = None
+        self.model_size = MODEL_SIZE
+        self.compute_type = COMPUTE_TYPE
+        self.beam_size = BEAM_SIZE
         self.model_lock = threading.Lock()
+
+    def set_settings(self, settings):
+        with self.model_lock:
+            model_size = settings["model_size"]
+            compute_type = settings["compute_type"]
+            if model_size != self.model_size or compute_type != self.compute_type:
+                self.model = None
+            self.model_size = model_size
+            self.compute_type = compute_type
+            self.beam_size = int(settings["beam_size"])
 
     def preload_model(self):
         try:
@@ -508,12 +569,12 @@ class Transcriber:
                 if self.model is not None:
                     return
 
-                self.log("文字起こしモデルを読み込み中...")
+                self.log(f"文字起こしモデルを読み込み中: {self.model_size}")
 
                 self.model = WhisperModel(
-                    MODEL_SIZE,
+                    self.model_size,
                     device="cpu",
-                    compute_type=COMPUTE_TYPE
+                    compute_type=self.compute_type
                 )
 
                 self.log("文字起こしモデル読み込み完了。")
@@ -535,7 +596,7 @@ class Transcriber:
                 vad_parameters=dict(
                     min_silence_duration_ms=500
                 ),
-                beam_size=10,
+                beam_size=self.beam_size,
                 temperature=0.0,
                 condition_on_previous_text=False,
                 word_timestamps=False,
@@ -634,6 +695,8 @@ class App:
 
         self.recorder = AudioRecorder(self.add_log)
         self.transcriber = Transcriber(self.add_log)
+        self.app_settings = load_app_settings()
+        self.transcriber.set_settings(self.app_settings)
 
         self.system_devices = []
         self.mic_devices = []
@@ -643,6 +706,9 @@ class App:
         self.status_title_var = tk.StringVar(value="停止中")
         self.status_detail_var = tk.StringVar(value="録音は開始されていません")
         self.current_transcription_var = tk.StringVar(value="文字起こし: 待機中")
+        self.model_var = tk.StringVar(value=MODEL_CHOICES[self.app_settings["model_size"]])
+        self.mode_var = tk.StringVar(value=self.app_settings["mode"])
+        self.settings_summary_var = tk.StringVar()
         self.session_name_var = tk.StringVar(value="")
         self.recording_session_name = ""
 
@@ -906,24 +972,8 @@ class App:
         self.start_transcribe_btn.pack(side="left")
 
         ttk.Label(analysis_tab, text="文字起こしキュー", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
-        queue_card, queue_frame = self._card(analysis_tab, padx=12, pady=12)
-        queue_card.pack(fill="x", pady=(0, 10))
-
-        drop_area = tk.Frame(
-            queue_frame,
-            bg="#fffafa",
-            highlightthickness=1,
-            highlightbackground=self.border_color,
-            height=150,
-        )
-        drop_area.pack(fill="x")
-        drop_area.pack_propagate(False)
-        tk.Label(drop_area, text="▣", bg="#fffafa", fg=self.accent_color, font=("Yu Gothic UI", 28, "bold")).pack(pady=(30, 6))
-        tk.Label(drop_area, text="ここに txt 対象フォルダを追加", bg="#fffafa", fg=self.text_color, font=("Yu Gothic UI", 9, "bold")).pack()
-        tk.Label(drop_area, text="下のボタンから選択してください", bg="#fffafa", fg=self.muted_color, font=("Yu Gothic UI", 8)).pack(pady=(6, 0))
-
         queue_btn_frame = ttk.Frame(analysis_tab, style="Tab.TFrame")
-        queue_btn_frame.pack(fill="x", pady=(0, 14))
+        queue_btn_frame.pack(fill="x", pady=(0, 12))
         ttk.Button(
             queue_btn_frame,
             text="+  フォルダ追加",
@@ -956,6 +1006,56 @@ class App:
 
         settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         settings_top_frame.pack(fill="x")
+
+        settings_card, settings_frame = self._card(settings_tab, padx=12, pady=12)
+        settings_card.pack(fill="x", pady=(0, 12))
+        ttk.Label(settings_frame, text="文字起こし設定", style="Section.Card.TLabel").grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 12),
+        )
+        ttk.Label(settings_frame, text="モデル", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+        self.model_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.model_var,
+            values=list(MODEL_CHOICES.values()),
+            state="readonly",
+            width=30,
+        )
+        self.model_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+
+        ttk.Label(settings_frame, text="処理モード", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+        self.mode_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.mode_var,
+            values=list(MODE_CHOICES.keys()),
+            state="readonly",
+            width=30,
+        )
+        self.mode_combo.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+
+        ttk.Label(
+            settings_frame,
+            textvariable=self.settings_summary_var,
+            style="Muted.Card.TLabel",
+            wraplength=340,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 10))
+
+        self.save_settings_btn = ttk.Button(
+            settings_frame,
+            text="設定を保存",
+            style="Primary.TButton",
+            command=self.save_transcription_settings,
+        )
+        self.save_settings_btn.grid(row=4, column=1, sticky="e")
+        settings_frame.columnconfigure(1, weight=1)
+        self.model_combo.bind("<<ComboboxSelected>>", lambda event=None: self.refresh_settings_summary())
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda event=None: self.refresh_settings_summary())
+        self.refresh_settings_summary()
+
         self.open_error_btn = ttk.Button(
             settings_top_frame,
             text="▤  エラーログを開く",
@@ -984,6 +1084,57 @@ class App:
         self.add_log("アプリを起動しました。")
         self.add_log(f"録音フォルダ: {BASE_DIR}")
         self.add_log(f"エラーログ: {ERROR_LOG}")
+        self.add_log(
+            f"文字起こし設定: model={self.app_settings['model_size']}, "
+            f"mode={self.app_settings['mode']}, beam_size={self.app_settings['beam_size']}, "
+            f"compute_type={self.app_settings['compute_type']}"
+        )
+
+    def selected_model_size(self):
+        selected = self.model_var.get()
+        for model_size, label in MODEL_CHOICES.items():
+            if label == selected:
+                return model_size
+        return DEFAULT_SETTINGS["model_size"]
+
+    def refresh_settings_summary(self):
+        if not hasattr(self, "settings_summary_var"):
+            return
+        model_size = self.selected_model_size()
+        mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
+        beam_size = MODE_CHOICES[mode]
+        self.settings_summary_var.set(
+            f"次回の文字起こしから反映します。model={model_size}, "
+            f"beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
+            "初回利用時はモデルのダウンロードに時間がかかります。"
+        )
+
+    def save_transcription_settings(self):
+        if self.transcription_running:
+            safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に保存してください。")
+            return
+
+        mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
+        settings = {
+            "model_size": self.selected_model_size(),
+            "mode": mode,
+            "beam_size": MODE_CHOICES[mode],
+            "compute_type": COMPUTE_TYPE,
+        }
+
+        try:
+            save_app_settings(settings)
+            self.app_settings = settings
+            self.transcriber.set_settings(settings)
+            self.refresh_settings_summary()
+            self.add_log(
+                f"文字起こし設定を保存: model={settings['model_size']}, "
+                f"mode={settings['mode']}, beam_size={settings['beam_size']}"
+            )
+            safe_messagebox_info("保存しました", "文字起こし設定を保存しました。次回の文字起こしから反映します。")
+        except Exception as e:
+            write_error_log("App.save_transcription_settings error", e)
+            safe_messagebox_error("エラー", f"設定を保存できませんでした。\n\n{e}")
 
     def load_devices(self):
         try:
