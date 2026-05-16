@@ -756,9 +756,9 @@ class App:
         self.preview_delay_ms = 1500
 
         self.last_output_dir = None
+        self.original_lid_action = None
         self.transcription_queue = []
         self.transcription_running = False
-        self.default_bg = self.root.cget("bg")
         self.status_var.trace_add("write", lambda *_: self.refresh_status_banner())
 
         self.build_ui()
@@ -1102,6 +1102,12 @@ class App:
                 return model_size
         return DEFAULT_SETTINGS["model_size"]
 
+    def run_on_ui_thread(self, func, *args, **kwargs):
+        if threading.get_ident() == self.main_thread_id:
+            func(*args, **kwargs)
+        else:
+            self.root.after(0, lambda: func(*args, **kwargs))
+
     def refresh_settings_summary(self):
         if not hasattr(self, "settings_summary_var"):
             return
@@ -1236,6 +1242,7 @@ class App:
 
         except Exception as e:
             write_error_log("App.start_recording error", e)
+            self.restore_lid_action()
             self.status_var.set("エラー")
             self.add_log(f"録音開始失敗: {e}")
             if "デバイス情報の取得に失敗" in str(e):
@@ -1260,7 +1267,7 @@ class App:
                 self.level_job = None
 
             result = self.recorder.stop()
-            self.set_lid_action_sleep()
+            self.restore_lid_action()
             self.update_recording_visual_state(is_recording=False)
 
             self.reset_level_meter()
@@ -1289,6 +1296,7 @@ class App:
                 f"録音停止に失敗しました。\n\n{e}\n\n詳細は {ERROR_LOG} を確認してください。"
             )
             self.update_recording_visual_state(is_recording=False)
+            self.restore_lid_action()
 
     def run_transcription(self, result, notify=True):
         try:
@@ -1310,10 +1318,11 @@ class App:
             self.add_log("文字起こしが完了しました。")
             self.add_log(f"保存フォルダ: {result['output_dir']}")
 
-            self.root.after(0, lambda: self.status_var.set("完了"))
-            self.root.after(0, lambda: self.current_transcription_var.set("文字起こし: 完了"))
+            self.run_on_ui_thread(self.status_var.set, "完了")
+            self.run_on_ui_thread(self.current_transcription_var.set, "文字起こし: 完了")
             if notify:
-                safe_messagebox_info(
+                self.run_on_ui_thread(
+                    safe_messagebox_info,
                     "完了",
                     f"文字起こしが完了しました。\n\n保存先:\n{result['txt_out']}"
                 )
@@ -1321,17 +1330,15 @@ class App:
 
         except Exception as e:
             write_error_log("App.run_transcription error", e)
-            self.root.after(0, lambda: self.status_var.set("エラー"))
-            self.root.after(0, lambda: self.current_transcription_var.set("文字起こし: エラー"))
+            self.run_on_ui_thread(self.status_var.set, "エラー")
+            self.run_on_ui_thread(self.current_transcription_var.set, "文字起こし: エラー")
             self.add_log(f"文字起こしエラー: {e}")
-            safe_messagebox_error(
+            self.run_on_ui_thread(
+                safe_messagebox_error,
                 "エラー",
                 f"文字起こしに失敗しました。\n\n{e}\n\n詳細は {ERROR_LOG} を確認してください。"
             )
             return False
-
-        finally:
-            pass
 
     def enqueue_transcription_job(self, result):
         self.transcription_queue.append(result)
@@ -1481,20 +1488,6 @@ class App:
         )
         return None
 
-    @staticmethod
-    def _is_bluetooth_or_handsfree(name):
-        lower = (name or "").lower()
-        keywords = [
-            "hands-free",
-            "hands free",
-            "hfp",
-            "hsp",
-            "bluetooth",
-            "ヘッドセット",
-            "ハンズフリー",
-        ]
-        return any(k in lower for k in keywords)
-
     def start_preview_level_meter(self):
         self.preview_start_job = None
         self.stop_preview_level_meter()
@@ -1519,8 +1512,10 @@ class App:
             system_name = system_device.get("name", "")
             mic_name = mic_device.get("name", "")
             unstable_pair = (
-                self._is_bluetooth_or_handsfree(system_name)
-                or self._is_bluetooth_or_handsfree(mic_name)
+                AudioRecorder._is_headset_device({"name": system_name})
+                or AudioRecorder._is_headphone_device({"name": system_name})
+                or AudioRecorder._is_headset_device({"name": mic_name})
+                or AudioRecorder._is_headphone_device({"name": mic_name})
             )
 
             if unstable_pair:
@@ -1716,21 +1711,62 @@ class App:
         for cmd in commands:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
 
+    def _get_lid_action_value(self, power_mode):
+        result = subprocess.run(
+            ["powercfg", f"/GET{power_mode}VALUEINDEX", "SCHEME_CURRENT", "SUB_BUTTONS", LIDCLOSE_GUID],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        matches = re.findall(r"0x[0-9a-fA-F]+|\b\d+\b", result.stdout)
+        if not matches:
+            raise RuntimeError(f"powercfg {power_mode} value not found: {result.stdout.strip()}")
+        return int(matches[-1], 0)
+
+    def remember_lid_action(self):
+        if os.name != "nt" or self.original_lid_action is not None:
+            return self.original_lid_action is not None
+        try:
+            self.original_lid_action = (
+                self._get_lid_action_value("AC"),
+                self._get_lid_action_value("DC"),
+            )
+            self.add_log(
+                "電源設定記憶: カバーを閉じたときの動作 "
+                f"AC={self.original_lid_action[0]}, DC={self.original_lid_action[1]}"
+            )
+            return True
+        except Exception as e:
+            self.original_lid_action = None
+            write_error_log("App.remember_lid_action error", e)
+            self.add_log(f"電源設定の現在値を取得できませんでした: {e}")
+            return False
+
     def set_lid_action_keep_running(self):
         try:
+            if not self.remember_lid_action():
+                self.add_log("電源設定変更をスキップ: 復元用の現在値を取得できませんでした。")
+                return
             self._set_lid_action(ac_value=0, dc_value=0)
             self.add_log("電源設定変更: カバーを閉じたときの動作 = 何もしない")
         except Exception as e:
             write_error_log("App.set_lid_action_keep_running error", e)
             self.add_log(f"電源設定変更失敗（録音中）: {e}")
 
-    def set_lid_action_sleep(self):
+    def restore_lid_action(self):
+        if os.name != "nt" or self.original_lid_action is None:
+            return
         try:
-            self._set_lid_action(ac_value=1, dc_value=1)
-            self.add_log("電源設定変更: カバーを閉じたときの動作 = スリープ")
+            ac_value, dc_value = self.original_lid_action
+            self._set_lid_action(ac_value=ac_value, dc_value=dc_value)
+            self.add_log(
+                "電源設定復元: カバーを閉じたときの動作 "
+                f"AC={ac_value}, DC={dc_value}"
+            )
+            self.original_lid_action = None
         except Exception as e:
-            write_error_log("App.set_lid_action_sleep error", e)
-            self.add_log(f"電源設定変更失敗（停止時）: {e}")
+            write_error_log("App.restore_lid_action error", e)
+            self.add_log(f"電源設定復元失敗（停止時）: {e}")
 
     def add_log(self, text):
         if threading.get_ident() != self.main_thread_id:
@@ -1752,7 +1788,7 @@ class App:
 
             self.stop_preview_level_meter()
             self.recorder.stop()
-            self.set_lid_action_sleep()
+            self.restore_lid_action()
             self.update_recording_visual_state(is_recording=False)
 
         except Exception as e:
