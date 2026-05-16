@@ -1,7 +1,7 @@
 import math
 import os
 import sys
-import json
+import re
 import struct
 import threading
 import subprocess
@@ -26,7 +26,6 @@ BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 ERROR_LOG = BASE_DIR / "error_log.txt"
-SETTINGS_FILE = BASE_DIR / "app_settings.json"
 
 FORMAT = pyaudio.paInt16
 CHUNK = 2048
@@ -101,32 +100,6 @@ def safe_messagebox_error(title, message):
     _safe_messagebox(messagebox.showerror, title, message)
 
 
-def load_app_settings():
-    settings = DEFAULT_SETTINGS.copy()
-    try:
-        if SETTINGS_FILE.exists():
-            loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                settings.update(loaded)
-    except Exception as e:
-        write_error_log("load_app_settings error", e)
-
-    if settings.get("model_size") not in MODEL_CHOICES:
-        settings["model_size"] = DEFAULT_SETTINGS["model_size"]
-    if settings.get("mode") not in MODE_CHOICES:
-        settings["mode"] = DEFAULT_SETTINGS["mode"]
-    settings["beam_size"] = MODE_CHOICES[settings["mode"]]
-    settings["compute_type"] = COMPUTE_TYPE
-    return settings
-
-
-def save_app_settings(settings):
-    SETTINGS_FILE.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
 # =========================
 # 録音
 # =========================
@@ -198,7 +171,6 @@ class AudioRecorder:
     def device_label(device, fallback_kind="デバイス"):
         raw_name = device.get("name", "") or "不明なデバイス"
         display_name = raw_name.replace("[Loopback]", "").replace("(Loopback)", "").strip()
-        display_name = display_name.replace("  ", " ")
 
         if AudioRecorder._is_headset_device(device):
             kind = "ヘッドセット"
@@ -210,6 +182,15 @@ class AudioRecorder:
             kind = "マイク"
         else:
             kind = fallback_kind
+
+        display_name = re.sub(
+            r"^(ヘッドセット|ヘッドホン|ヘッドフォン|headset|headphones?|hands-free|hands free|スピーカー|speaker|マイク|microphone|mic)\s*[\(（]?\s*\d*\s*[-:：]?\s*",
+            "",
+            display_name,
+            flags=re.IGNORECASE,
+        )
+        display_name = re.sub(r"\s+", " ", display_name).strip(" )）(（")
+        display_name = display_name or raw_name
 
         return f"{kind}: {display_name}"
 
@@ -747,7 +728,7 @@ class App:
 
         self.recorder = AudioRecorder(self.add_log)
         self.transcriber = Transcriber(self.add_log)
-        self.app_settings = load_app_settings()
+        self.app_settings = DEFAULT_SETTINGS.copy()
         self.transcriber.set_settings(self.app_settings)
 
         self.system_devices = []
@@ -811,20 +792,8 @@ class App:
         notebook.add(analysis_tab, text="▥  分析")
         notebook.add(settings_tab, text="⚙  設定")
 
-        top_frame = ttk.Frame(home_tab, padding=(4, 18, 4, 12), style="Tab.TFrame")
+        top_frame = ttk.Frame(home_tab, padding=(4, 4, 4, 12), style="Tab.TFrame")
         top_frame.pack(fill="x")
-
-        ttk.Label(
-            top_frame,
-            text="文字起こしレコーダー",
-            style="Title.TLabel"
-        ).pack(anchor="w")
-
-        desc = (
-            "録音開始時だけ音声デバイスを開きます。\n"
-            "録音停止後、文字起こしのみを txt 保存します。"
-        )
-        ttk.Label(top_frame, text=desc, foreground=self.muted_color).pack(anchor="w", pady=(6, 0))
 
         self.status_banner = tk.Frame(
             top_frame,
@@ -833,7 +802,7 @@ class App:
             highlightbackground="#f4d9e2",
             highlightcolor="#f4d9e2",
         )
-        self.status_banner.pack(fill="x", pady=(14, 0))
+        self.status_banner.pack(fill="x")
         self.status_title_label = tk.Label(
             self.status_banner,
             textvariable=self.status_title_var,
@@ -919,32 +888,8 @@ class App:
         device_frame.columnconfigure(0, weight=1)
         device_frame.columnconfigure(1, weight=0)
 
-        status_card, status_frame = self._card(home_tab, padx=12, pady=12)
-        status_card.pack(fill="x", pady=(0, 10))
-
-        top_status = ttk.Frame(status_frame, style="Card.TFrame")
-        top_status.pack(fill="x")
-        ttk.Label(top_status, text="状態:", style="Card.TLabel").pack(side="left")
-        ttk.Label(top_status, textvariable=self.status_var, foreground=self.accent_color, style="Card.TLabel").pack(side="left", padx=(4, 24))
-        ttk.Label(top_status, textvariable=self.timer_var, style="Card.TLabel").pack(side="left")
-
-        name_frame = ttk.Frame(status_frame, style="Card.TFrame")
-        name_frame.pack(fill="x", pady=(12, 0))
-        ttk.Label(name_frame, text="任意名:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(name_frame, text="フォルダ/文字起こし名:", style="Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
-        self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
-        self.name_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self.output_name_hint = ttk.Label(
-            name_frame,
-            text="yyyy年mm月dd日hh:MM-任意名",
-            style="Muted.Card.TLabel"
-        )
-        self.output_name_hint.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(4, 0))
-        name_frame.columnconfigure(0, weight=1)
-        name_frame.columnconfigure(1, weight=1)
-
         level_card, level_frame = self._card(home_tab, padx=12, pady=12)
-        level_card.pack(fill="x", pady=(0, 12))
+        level_card.pack(fill="x", pady=(0, 10))
         ttk.Label(level_frame, text="ⓘ  録音中の入力レベル", style="Section.Card.TLabel").grid(
             row=0,
             column=0,
@@ -982,6 +927,21 @@ class App:
         self.mic_level_label.grid(row=2, column=2, sticky="e")
 
         level_frame.columnconfigure(1, weight=1)
+
+        name_card, name_frame = self._card(home_tab, padx=12, pady=12)
+        name_card.pack(fill="x", pady=(0, 12))
+        ttk.Label(name_frame, text="任意名:", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(name_frame, text="フォルダ/文字起こし名:", style="Card.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.name_entry = ttk.Entry(name_frame, textvariable=self.session_name_var, width=40)
+        self.name_entry.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.output_name_hint = ttk.Label(
+            name_frame,
+            text="yyyy年mm月dd日hh:MM-任意名",
+            style="Muted.Card.TLabel"
+        )
+        self.output_name_hint.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(4, 0))
+        name_frame.columnconfigure(0, weight=1)
+        name_frame.columnconfigure(1, weight=1)
 
         btn_frame = ttk.Frame(home_tab, padding=(0, 0, 0, 6), style="Tab.TFrame")
         btn_frame.pack(fill="x")
@@ -1096,16 +1056,9 @@ class App:
             justify="left",
         ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
-        self.save_settings_btn = ttk.Button(
-            settings_frame,
-            text="設定を保存",
-            style="Primary.TButton",
-            command=self.save_transcription_settings,
-        )
-        self.save_settings_btn.grid(row=4, column=1, sticky="e")
         settings_frame.columnconfigure(1, weight=1)
-        self.model_combo.bind("<<ComboboxSelected>>", lambda event=None: self.refresh_settings_summary())
-        self.mode_combo.bind("<<ComboboxSelected>>", lambda event=None: self.refresh_settings_summary())
+        self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
+        self.mode_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.refresh_settings_summary()
 
         self.open_error_btn = ttk.Button(
@@ -1156,14 +1109,17 @@ class App:
         mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
         beam_size = MODE_CHOICES[mode]
         self.settings_summary_var.set(
-            f"次回の文字起こしから反映します。model={model_size}, "
+            f"選択中の起動中だけ有効です。次回の文字起こしから反映します。model={model_size}, "
             f"beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
             "初回利用時はモデルのダウンロードに時間がかかります。"
         )
 
-    def save_transcription_settings(self):
+    def on_transcription_setting_changed(self, event=None):
         if self.transcription_running:
-            safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に保存してください。")
+            self.model_var.set(MODEL_CHOICES[self.app_settings["model_size"]])
+            self.mode_var.set(self.app_settings["mode"])
+            self.refresh_settings_summary()
+            safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に変更してください。")
             return
 
         mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
@@ -1174,19 +1130,13 @@ class App:
             "compute_type": COMPUTE_TYPE,
         }
 
-        try:
-            save_app_settings(settings)
-            self.app_settings = settings
-            self.transcriber.set_settings(settings)
-            self.refresh_settings_summary()
-            self.add_log(
-                f"文字起こし設定を保存: model={settings['model_size']}, "
-                f"mode={settings['mode']}, beam_size={settings['beam_size']}"
-            )
-            safe_messagebox_info("保存しました", "文字起こし設定を保存しました。次回の文字起こしから反映します。")
-        except Exception as e:
-            write_error_log("App.save_transcription_settings error", e)
-            safe_messagebox_error("エラー", f"設定を保存できませんでした。\n\n{e}")
+        self.app_settings = settings
+        self.transcriber.set_settings(settings)
+        self.refresh_settings_summary()
+        self.add_log(
+            f"文字起こし設定を変更: model={settings['model_size']}, "
+            f"mode={settings['mode']}, beam_size={settings['beam_size']}"
+        )
 
     def load_devices(self):
         try:
