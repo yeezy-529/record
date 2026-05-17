@@ -825,12 +825,15 @@ class App:
 
         self.last_output_dir = None
         self.original_lid_action = None
+        self.lid_action_available = False
+        self.lid_action_changed = False
         self.transcription_queue = []
         self.transcription_running = False
         self.status_var.trace_add("write", lambda *_: self.refresh_status_banner())
 
         self.build_ui()
         self.update_recording_visual_state(is_recording=False)
+        self.load_lid_action_settings()
 
         self.root.after(100, self.load_devices)
 
@@ -1876,30 +1879,44 @@ class App:
             raise RuntimeError(f"powercfg {power_mode} value not found: {result.stdout.strip()}")
         return int(matches[-1], 0)
 
-    def remember_lid_action(self):
-        if os.name != "nt" or self.original_lid_action is not None:
-            return self.original_lid_action is not None
+    def _format_powercfg_error(self, error):
+        if isinstance(error, subprocess.CalledProcessError):
+            detail = (error.stderr or error.stdout or "").strip()
+            if detail:
+                return detail
+            return f"powercfg exited with code {error.returncode}"
+        return str(error)
+
+    def load_lid_action_settings(self):
+        if os.name != "nt":
+            self.add_log("電源設定確認をスキップ: Windows 以外の環境です。")
+            return
+
         try:
             self.original_lid_action = (
                 self._get_lid_action_value("AC"),
                 self._get_lid_action_value("DC"),
             )
+            self.lid_action_available = True
             self.add_log(
-                "電源設定記憶: カバーを閉じたときの動作 "
+                "電源設定取得: カバーを閉じたときの動作 "
                 f"AC={self.original_lid_action[0]}, DC={self.original_lid_action[1]}"
             )
-            return True
         except Exception as e:
             self.original_lid_action = None
-            write_error_log("App.remember_lid_action error", e)
-            self.add_log(f"電源設定の現在値を取得できませんでした: {e}")
-            return False
+            self.lid_action_available = False
+            self.add_log(
+                "カバー動作設定を取得できませんでした。デスクトップPCまたは非対応環境のため、"
+                "録音中の電源設定変更をスキップします。"
+            )
+            self.add_log(f"powercfg取得結果: {self._format_powercfg_error(e)}")
 
     def set_lid_action_keep_running(self):
         try:
-            if not self.remember_lid_action():
-                self.add_log("電源設定変更をスキップ: 復元用の現在値を取得できませんでした。")
+            if not self.lid_action_available or self.original_lid_action is None:
+                self.add_log("電源設定変更をスキップ: カバー動作設定を起動時に取得できませんでした。")
                 return
+            self.lid_action_changed = True
             self._set_lid_action(ac_value=0, dc_value=0)
             self.add_log("電源設定変更: カバーを閉じたときの動作 = 何もしない")
         except Exception as e:
@@ -1907,7 +1924,7 @@ class App:
             self.add_log(f"電源設定変更失敗（録音中）: {e}")
 
     def restore_lid_action(self):
-        if os.name != "nt" or self.original_lid_action is None:
+        if os.name != "nt" or not self.lid_action_changed or self.original_lid_action is None:
             return
         try:
             ac_value, dc_value = self.original_lid_action
@@ -1916,7 +1933,7 @@ class App:
                 "電源設定復元: カバーを閉じたときの動作 "
                 f"AC={ac_value}, DC={dc_value}"
             )
-            self.original_lid_action = None
+            self.lid_action_changed = False
         except Exception as e:
             write_error_log("App.restore_lid_action error", e)
             self.add_log(f"電源設定復元失敗（停止時）: {e}")
@@ -1952,6 +1969,9 @@ class App:
 
 
 def global_exception_handler(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        return
+
     try:
         ensure_error_log()
 
@@ -1981,7 +2001,13 @@ def main():
 
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        try:
+            app.on_close()
+        except tk.TclError:
+            pass
 
 
 if __name__ == "__main__":
