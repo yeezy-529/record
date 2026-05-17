@@ -43,6 +43,12 @@ MODEL_CHOICES = {
     "large-v3-turbo": "large-v3-turbo（高速）",
 }
 
+MODEL_FILENAME_CODES = {
+    "medium": "m",
+    "large-v3": "la3",
+    "large-v3-turbo": "la3t",
+}
+
 MODE_CHOICES = {
     "高速": 1,
     "標準": 5,
@@ -1239,6 +1245,14 @@ class App:
         self.add_log(f"メモ保存: {memo_path}")
         return memo_path
 
+    def transcript_txt_path(self, output_dir, settings=None):
+        settings = settings or self.app_settings
+        output_dir = Path(output_dir)
+        model_size = settings.get("model_size", DEFAULT_SETTINGS["model_size"])
+        model_code = MODEL_FILENAME_CODES.get(model_size, model_size.replace("-", ""))
+        beam_size = int(settings.get("beam_size", DEFAULT_SETTINGS["beam_size"]))
+        return output_dir / f"{output_dir.name}_{model_code}_{beam_size}.txt"
+
     def selected_model_size(self):
         selected = self.model_var.get()
         for model_size, label in MODEL_CHOICES.items():
@@ -1452,6 +1466,7 @@ class App:
         try:
             job_name = Path(result["output_dir"]).name
             self.root.after(0, lambda name=job_name: self.set_transcription_status(name))
+            result["txt_out"] = self.transcript_txt_path(result["output_dir"], self.app_settings)
             system_rows = self.transcriber.transcribe_file(
                 result["system_wav"],
                 "相手"
@@ -1524,7 +1539,7 @@ class App:
             "output_dir": folder,
             "system_wav": folder / "system.wav",
             "mic_wav": folder / "mic.wav",
-            "txt_out": folder / f"{folder.name}.txt",
+            "txt_out": self.transcript_txt_path(folder),
             "memo_path": folder / "memo.txt",
         }
         if not job["system_wav"].exists() or not job["mic_wav"].exists():
