@@ -784,7 +784,10 @@ class App:
         self.style.configure("Section.Card.TLabel", background=self.card_color, foreground=self.text_color, font=("Yu Gothic UI", 10, "bold"))
         self.style.configure("Accent.TButton", foreground=self.accent_color, font=("Yu Gothic UI", 9, "bold"), padding=(14, 8))
         self.style.configure("Primary.TButton", foreground="#ffffff", background=self.accent_color, font=("Yu Gothic UI", 9, "bold"), padding=(14, 9))
+        self.style.configure("Small.Primary.TButton", foreground="#ffffff", background=self.accent_color, font=("Yu Gothic UI", 8, "bold"), padding=(10, 6))
+        self.style.configure("Small.TButton", font=("Yu Gothic UI", 8), padding=(10, 6))
         self.style.map("Primary.TButton", background=[("active", "#ff477d"), ("disabled", "#f3c4d1")])
+        self.style.map("Small.Primary.TButton", background=[("active", "#ff477d"), ("disabled", "#f3c4d1")])
         self.style.configure("Soft.Horizontal.TProgressbar", troughcolor="#ffe6ee", background=self.accent_color, bordercolor="#ffe6ee", lightcolor=self.accent_color, darkcolor=self.accent_color)
 
         self.main_thread_id = threading.get_ident()
@@ -805,8 +808,10 @@ class App:
         self.model_var = tk.StringVar(value=MODEL_CHOICES[self.app_settings["model_size"]])
         self.mode_var = tk.StringVar(value=self.app_settings["mode"])
         self.settings_summary_var = tk.StringVar()
-        self.recording_system_label_var = tk.StringVar(value="相手音声: 0%")
-        self.recording_mic_label_var = tk.StringVar(value="マイク: 0%")
+        self.recording_system_device_var = tk.StringVar(value="相手音声")
+        self.recording_mic_device_var = tk.StringVar(value="マイク")
+        self.recording_system_percent_var = tk.StringVar(value="0%")
+        self.recording_mic_percent_var = tk.StringVar(value="0%")
 
         self.elapsed_seconds = 0
         self.timer_job = None
@@ -994,24 +999,10 @@ class App:
         self.start_transcribe_btn.pack(side="left")
 
         ttk.Label(analysis_tab, text="文字起こしキュー", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
-        queue_btn_frame = ttk.Frame(analysis_tab, style="Tab.TFrame")
-        queue_btn_frame.pack(fill="x", pady=(0, 12))
-        ttk.Button(
-            queue_btn_frame,
-            text="+  フォルダ追加",
-            style="Primary.TButton",
-            command=self.add_queue_from_dialog
-        ).pack(side="left")
-        ttk.Button(
-            queue_btn_frame,
-            text="♲  選択削除",
-            command=self.remove_selected_queue
-        ).pack(side="left", padx=(8, 0))
-
         self.queue_count_label = ttk.Label(analysis_tab, text="追加済みファイル（0 件）", font=("Yu Gothic UI", 10, "bold"))
         self.queue_count_label.pack(anchor="w", padx=4, pady=(0, 8))
         list_card, list_frame = self._card(analysis_tab, padx=12, pady=12)
-        list_card.pack(fill="both", expand=True, pady=(0, 0))
+        list_card.pack(fill="both", expand=True, pady=(0, 8))
         self.queue_listbox = tk.Listbox(
             list_frame,
             height=8,
@@ -1025,6 +1016,23 @@ class App:
             font=("Yu Gothic UI", 9),
         )
         self.queue_listbox.pack(fill="both", expand=True)
+
+        queue_btn_frame = ttk.Frame(analysis_tab, style="Tab.TFrame")
+        queue_btn_frame.pack(fill="x", pady=(0, 12))
+        ttk.Button(
+            queue_btn_frame,
+            text="+  フォルダ追加",
+            style="Small.Primary.TButton",
+            command=self.add_queue_from_dialog,
+            width=13,
+        ).pack(side="left")
+        ttk.Button(
+            queue_btn_frame,
+            text="♲  選択削除",
+            style="Small.TButton",
+            command=self.remove_selected_queue,
+            width=12,
+        ).pack(side="left", padx=(8, 0))
 
         settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         settings_top_frame.pack(fill="x")
@@ -1122,26 +1130,60 @@ class App:
         system_card, system_frame = self._card(levels_frame, padx=10, pady=10)
         system_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         ttk.Label(system_frame, text="相手音声", style="Section.Card.TLabel").pack(anchor="w")
-        self.recording_system_label = ttk.Label(
+        self.recording_system_device_label = ttk.Label(
             system_frame,
-            textvariable=self.recording_system_label_var,
+            textvariable=self.recording_system_device_var,
             style="Muted.Card.TLabel",
             wraplength=170,
             justify="left",
         )
-        self.recording_system_label.pack(anchor="w", pady=(6, 0))
+        self.recording_system_device_label.pack(anchor="w", fill="x", pady=(6, 4))
+        system_meter_frame = ttk.Frame(system_frame, style="Card.TFrame")
+        system_meter_frame.pack(fill="x")
+        self.recording_system_bar = ttk.Progressbar(
+            system_meter_frame,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            style="Soft.Horizontal.TProgressbar",
+        )
+        self.recording_system_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Label(
+            system_meter_frame,
+            textvariable=self.recording_system_percent_var,
+            style="Card.TLabel",
+            width=4,
+            anchor="e",
+        ).pack(side="right")
 
         mic_card, mic_frame = self._card(levels_frame, padx=10, pady=10)
         mic_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         ttk.Label(mic_frame, text="マイク", style="Section.Card.TLabel").pack(anchor="w")
-        self.recording_mic_label = ttk.Label(
+        self.recording_mic_device_label = ttk.Label(
             mic_frame,
-            textvariable=self.recording_mic_label_var,
+            textvariable=self.recording_mic_device_var,
             style="Muted.Card.TLabel",
             wraplength=170,
             justify="left",
         )
-        self.recording_mic_label.pack(anchor="w", pady=(6, 0))
+        self.recording_mic_device_label.pack(anchor="w", fill="x", pady=(6, 4))
+        mic_meter_frame = ttk.Frame(mic_frame, style="Card.TFrame")
+        mic_meter_frame.pack(fill="x")
+        self.recording_mic_bar = ttk.Progressbar(
+            mic_meter_frame,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            style="Soft.Horizontal.TProgressbar",
+        )
+        self.recording_mic_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Label(
+            mic_meter_frame,
+            textvariable=self.recording_mic_percent_var,
+            style="Card.TLabel",
+            width=4,
+            anchor="e",
+        ).pack(side="right")
 
         levels_frame.columnconfigure(0, weight=1)
         levels_frame.columnconfigure(1, weight=1)
@@ -1172,8 +1214,17 @@ class App:
     def update_recording_device_labels(self):
         system_name = self.system_combo.get() or "相手音声"
         mic_name = self.mic_combo.get() or "マイク"
-        self.recording_system_label_var.set(f"{system_name}: {self.recorder.system_level}%")
-        self.recording_mic_label_var.set(f"{mic_name}: {self.recorder.mic_level}%")
+        self.recording_system_device_var.set(system_name)
+        self.recording_mic_device_var.set(mic_name)
+        self.update_recording_level_values(self.recorder.system_level, self.recorder.mic_level)
+
+    def update_recording_level_values(self, system_level, mic_level):
+        self.recording_system_percent_var.set(f"{system_level}%")
+        self.recording_mic_percent_var.set(f"{mic_level}%")
+        if hasattr(self, "recording_system_bar"):
+            self.recording_system_bar["value"] = system_level
+        if hasattr(self, "recording_mic_bar"):
+            self.recording_mic_bar["value"] = mic_level
 
     def save_recording_memo(self, output_dir):
         memo = self.memo_text.get("1.0", "end").strip()
@@ -1707,16 +1758,14 @@ class App:
         mic_level = self.recorder.mic_level
 
         if self.recorder.is_recording:
-            system_name = self.system_combo.get() or "相手音声"
-            mic_name = self.mic_combo.get() or "マイク"
-            self.recording_system_label_var.set(f"{system_name}: {system_level}%")
-            self.recording_mic_label_var.set(f"{mic_name}: {mic_level}%")
+            self.update_recording_level_values(system_level, mic_level)
 
         self.level_job = self.root.after(100, self.update_level_meter)
 
     def reset_level_meter(self):
-        self.recording_system_label_var.set("相手音声: 0%")
-        self.recording_mic_label_var.set("マイク: 0%")
+        self.recording_system_device_var.set("相手音声")
+        self.recording_mic_device_var.set("マイク")
+        self.update_recording_level_values(0, 0)
 
     def update_recording_visual_state(self, is_recording):
         if is_recording:
