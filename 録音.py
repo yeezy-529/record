@@ -922,6 +922,7 @@ class App:
         self.recording_mic_device_var = tk.StringVar(value="マイク")
         self.recording_system_percent_var = tk.StringVar(value="0%")
         self.recording_mic_percent_var = tk.StringVar(value="0%")
+        self.show_recording_percent_var = tk.BooleanVar(value=True)
 
         self.elapsed_seconds = 0
         self.timer_job = None
@@ -1242,6 +1243,14 @@ class App:
         )
         self.recording_stop_btn.pack(anchor="w", pady=(0, 12))
 
+        self.recording_percent_toggle_btn = ttk.Button(
+            self.recording_frame,
+            text="感度%を非表示",
+            style="Small.TButton",
+            command=self.toggle_recording_percent_visibility,
+        )
+        self.recording_percent_toggle_btn.pack(anchor="e", pady=(0, 12))
+
         levels_frame = ttk.Frame(self.recording_frame, style="Tab.TFrame")
         levels_frame.pack(fill="x", pady=(0, 12))
 
@@ -1266,13 +1275,14 @@ class App:
             style="Soft.Horizontal.TProgressbar",
         )
         self.recording_system_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Label(
+        self.recording_system_percent_label = ttk.Label(
             system_meter_frame,
             textvariable=self.recording_system_percent_var,
             style="Card.TLabel",
             width=4,
             anchor="e",
-        ).pack(side="right")
+        )
+        self.recording_system_percent_label.pack(side="right")
 
         mic_card, mic_frame = self._card(levels_frame, padx=10, pady=10)
         mic_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -1295,16 +1305,18 @@ class App:
             style="Soft.Horizontal.TProgressbar",
         )
         self.recording_mic_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Label(
+        self.recording_mic_percent_label = ttk.Label(
             mic_meter_frame,
             textvariable=self.recording_mic_percent_var,
             style="Card.TLabel",
             width=4,
             anchor="e",
-        ).pack(side="right")
+        )
+        self.recording_mic_percent_label.pack(side="right")
 
         levels_frame.columnconfigure(0, weight=1)
         levels_frame.columnconfigure(1, weight=1)
+        self.apply_recording_percent_visibility()
 
         memo_card, memo_frame = self._card(self.recording_frame, padx=10, pady=10)
         memo_card.pack(fill="both", expand=True)
@@ -1343,6 +1355,27 @@ class App:
             self.recording_system_bar["value"] = system_level
         if hasattr(self, "recording_mic_bar"):
             self.recording_mic_bar["value"] = mic_level
+
+    def toggle_recording_percent_visibility(self):
+        self.show_recording_percent_var.set(not self.show_recording_percent_var.get())
+        self.apply_recording_percent_visibility()
+
+    def apply_recording_percent_visibility(self):
+        show_percent = self.show_recording_percent_var.get()
+        if hasattr(self, "recording_system_percent_label"):
+            if show_percent:
+                self.recording_system_percent_label.pack(side="right")
+            else:
+                self.recording_system_percent_label.pack_forget()
+        if hasattr(self, "recording_mic_percent_label"):
+            if show_percent:
+                self.recording_mic_percent_label.pack(side="right")
+            else:
+                self.recording_mic_percent_label.pack_forget()
+        if hasattr(self, "recording_percent_toggle_btn"):
+            self.recording_percent_toggle_btn.configure(
+                text="感度%を非表示" if show_percent else "感度%を表示"
+            )
 
     def save_recording_memo(self, output_dir):
         memo = self.memo_text.get("1.0", "end").strip()
