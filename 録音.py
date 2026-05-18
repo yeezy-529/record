@@ -21,7 +21,7 @@ from faster_whisper import WhisperModel
 # =========================
 # 設定
 # =========================
-APP_TITLE = "文字起こしレコーダー"
+APP_TITLE = "レコードApp"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -762,8 +762,8 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("430x720")
-        self.root.minsize(400, 640)
+        self.root.geometry("430x480")
+        self.root.minsize(400, 480)
         self.bg_color = "#fff8fb"
         self.card_color = "#ffffff"
         self.text_color = "#1f2937"
@@ -1786,15 +1786,8 @@ class App:
         self.update_recording_level_values(0, 0)
 
     def update_recording_visual_state(self, is_recording):
-        if is_recording:
-            bg = self.bg_color
-            title = f"{APP_TITLE} ● 録音中"
-        else:
-            bg = self.bg_color
-            title = f"{APP_TITLE} ■ 停止中"
-
-        self.root.configure(bg=bg)
-        self.root.title(title)
+        self.root.configure(bg=self.bg_color)
+        self.root.title(APP_TITLE)
         self.refresh_status_banner()
         self._flash_taskbar_once()
 
