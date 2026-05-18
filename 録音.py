@@ -137,6 +137,7 @@ class AudioRecorder:
         self.system_wav = None
         self.mic_wav = None
         self.mixed_wav = None
+        self.mixed_compressed = None
         self.txt_out = None
 
     @staticmethod
@@ -335,6 +336,7 @@ class AudioRecorder:
             self.system_wav = self.output_dir / "system.wav"
             self.mic_wav = self.output_dir / "mic.wav"
             self.mixed_wav = self.output_dir / "mixed.wav"
+            self.mixed_compressed = self.output_dir / "mixed.m4a"
             self.txt_out = self.output_dir / f"{folder_name}.txt"
 
             self.system_frames = []
@@ -534,8 +536,13 @@ class AudioRecorder:
                             self.mic_channels,
                             self.mic_rate,
                         )
-                        mixed_wav = self.mixed_wav
-                        self.log(f"MIX音声保存: {self.mixed_wav}")
+                        compressed = self._compress_mixed_audio(self.mixed_wav, self.mixed_compressed)
+                        if compressed:
+                            mixed_wav = self.mixed_compressed
+                            self.log(f"MIX音声圧縮保存: {self.mixed_compressed}")
+                        else:
+                            mixed_wav = self.mixed_wav
+                            self.log(f"MIX音声保存(非圧縮): {self.mixed_wav}")
                     except Exception as e:
                         write_error_log("AudioRecorder.stop mixed wav error", e)
                         self.log(f"MIX音声保存失敗: {e}")
@@ -634,6 +641,31 @@ class AudioRecorder:
             wf.setsampwidth(2)
             wf.setframerate(target_rate)
             wf.writeframes(mixed_pcm)
+
+    def _compress_mixed_audio(self, src_wav, dst_m4a):
+        try:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src_wav),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                str(dst_m4a),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            if dst_m4a.exists():
+                try:
+                    src_wav.unlink()
+                except Exception as e:
+                    write_error_log("AudioRecorder._compress_mixed_audio unlink warning", e)
+                return True
+            return False
+        except Exception as e:
+            write_error_log("AudioRecorder._compress_mixed_audio error", e)
+            return False
 
 
 # =========================
