@@ -88,6 +88,17 @@ def write_error_log(title, error):
             f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {title}\n")
             f.write("=" * 80 + "\n")
             f.write(f"{repr(error)}\n\n")
+            if isinstance(error, urllib.error.HTTPError):
+                try:
+                    body = error.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
+                if body:
+                    f.write("HTTP response body:\n")
+                    f.write(body[:2000])
+                    f.write("\n\n")
+                else:
+                    f.write(f"HTTP response body empty: HTTP {error.code} {error.reason}\n\n")
             f.write(traceback.format_exc())
             f.write("\n")
     except Exception:
@@ -734,6 +745,12 @@ class Transcriber:
             self.log(f"文字起こし完了: {speaker_label}")
             return rows
 
+        except urllib.error.HTTPError as e:
+            self._raise_api_http_error(e)
+        except urllib.error.URLError as e:
+            error = RuntimeError(f"API文字起こしに接続できませんでした: {e}")
+            write_error_log(f"Transcriber.transcribe_file error: {speaker_label}", error)
+            raise error from e
         except Exception as e:
             write_error_log(f"Transcriber.transcribe_file error: {speaker_label}", e)
             raise
@@ -795,14 +812,9 @@ class Transcriber:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            detail, raw = self._read_api_error(e)
-            self.log(f"APIエラー詳細: HTTP {e.code} {e.reason}: {detail}")
-            if raw:
-                self.log(f"APIエラー本文: {raw[:500]}")
-            raise RuntimeError(
-                f"API文字起こしに失敗しました "
-                f"(HTTP {e.code}, model={self.api_model}, format=json)。詳細: {detail}"
-            ) from e
+            self._raise_api_http_error(e)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"API文字起こしに接続できませんでした: {e}") from e
 
         text = (payload.get("text") or "").strip()
         rows = []
@@ -816,6 +828,16 @@ class Transcriber:
 
         self.log(f"API文字起こし完了: {speaker_label}")
         return rows
+
+    def _raise_api_http_error(self, error):
+        detail, raw = self._read_api_error(error)
+        self.log(f"APIエラー詳細: HTTP {error.code} {error.reason}: {detail}")
+        if raw:
+            self.log(f"APIエラー本文: {raw[:500]}")
+        raise RuntimeError(
+            f"API文字起こしに失敗しました "
+            f"(HTTP {error.code}, model={self.api_model}, format=json)。詳細: {detail}"
+        ) from error
 
     def _build_multipart_body(self, fields, file_path):
         boundary = f"----recordapp-{uuid.uuid4().hex}"
