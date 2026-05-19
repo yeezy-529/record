@@ -776,31 +776,7 @@ class Transcriber:
             if self.model_size in API_TRANSCRIBE_MODELS:
                 rows = self._transcribe_file_api(audio_path, speaker_label)
             else:
-                self.preload_model()
-                segments, info = self.model.transcribe(
-                    str(audio_path),
-                    language=LANGUAGE,
-                    vad_filter=True,
-                    vad_parameters=dict(
-                        min_silence_duration_ms=500
-                    ),
-                    beam_size=self.beam_size,
-                    temperature=0.0,
-                    condition_on_previous_text=False,
-                    word_timestamps=False,
-                )
-
-                for seg in segments:
-                    text = (seg.text or "").strip()
-                    if not text:
-                        continue
-
-                        rows.append({
-                        "start": float(seg.start),
-                        "end": float(seg.end),
-                            "speaker": speaker_label,
-                            "text": text,
-                    })
+                rows = self._transcribe_file_local(audio_path, speaker_label)
 
             self.log(f"文字起こし完了: {speaker_label}")
             return rows
@@ -831,17 +807,39 @@ class Transcriber:
         if not pcm:
             raise RuntimeError(f"音声データ変換後にデータが空です: {audio_path.name}")
 
-        tmp = tempfile.NamedTemporaryFile(prefix="record_api_", suffix=".wav", delete=False)
-        tmp_path = Path(tmp.name)
-        tmp.close()
+        wav_tmp = tempfile.NamedTemporaryFile(prefix="record_api_", suffix=".wav", delete=False)
+        wav_tmp_path = Path(wav_tmp.name)
+        wav_tmp.close()
 
-        with wave.open(str(tmp_path), "wb") as wf:
+        with wave.open(str(wav_tmp_path), "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(target_rate)
             wf.writeframes(pcm)
 
-        return tmp_path
+        m4a_tmp = tempfile.NamedTemporaryFile(prefix="record_api_", suffix=".m4a", delete=False)
+        m4a_tmp_path = Path(m4a_tmp.name)
+        m4a_tmp.close()
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(wav_tmp_path),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            str(m4a_tmp_path),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if not m4a_tmp_path.exists() or m4a_tmp_path.stat().st_size <= 0:
+            raise RuntimeError("API送信用音声(m4a)の生成に失敗しました。")
+        try:
+            wav_tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return m4a_tmp_path, "audio/mp4"
 
     def _transcribe_file_api(self, audio_path, speaker_label):
         api_key = (self.openai_api_key or "").strip()
@@ -863,9 +861,8 @@ class Transcriber:
         except wave.Error as e:
             raise RuntimeError(f"音声ファイル形式を読み取れません: {audio_path.name}") from e
 
-        api_audio_path = self._prepare_api_audio_file(audio_path)
+        api_audio_path, mime_type = self._prepare_api_audio_file(audio_path)
         audio_bytes = api_audio_path.read_bytes()
-        mime_type = "audio/wav"
 
         parts = []
 
