@@ -3,12 +3,16 @@ import os
 import sys
 import re
 import audioop
+import json
 import struct
 import threading
 import subprocess
 import traceback
 import wave
 import ctypes
+import urllib.error
+import urllib.request
+import uuid
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -36,6 +40,10 @@ MODEL_SIZE = "large-v3"
 COMPUTE_TYPE = "int8"
 BEAM_SIZE = 5
 LIDCLOSE_GUID = "5ca83367-6e45-459f-a27b-476b1d01c936"
+TRANSCRIPTION_METHOD_LOCAL = "ローカル"
+TRANSCRIPTION_METHOD_API = "OpenAI API"
+API_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
+MIN_API_AUDIO_SECONDS = 1.0
 
 MODEL_CHOICES = {
     "medium": "medium（標準・軽め）",
@@ -56,6 +64,8 @@ MODE_CHOICES = {
 }
 
 DEFAULT_SETTINGS = {
+    "transcription_method": TRANSCRIPTION_METHOD_LOCAL,
+    "api_model": API_TRANSCRIBE_MODEL,
     "model_size": MODEL_SIZE,
     "mode": "標準",
     "beam_size": BEAM_SIZE,
@@ -646,10 +656,14 @@ class Transcriber:
         self.model_size = MODEL_SIZE
         self.compute_type = COMPUTE_TYPE
         self.beam_size = BEAM_SIZE
+        self.transcription_method = TRANSCRIPTION_METHOD_LOCAL
+        self.api_model = API_TRANSCRIBE_MODEL
         self.model_lock = threading.Lock()
 
     def set_settings(self, settings):
         with self.model_lock:
+            self.transcription_method = settings.get("transcription_method", TRANSCRIPTION_METHOD_LOCAL)
+            self.api_model = settings.get("api_model", API_TRANSCRIBE_MODEL)
             model_size = settings["model_size"]
             compute_type = settings["compute_type"]
             if model_size != self.model_size or compute_type != self.compute_type:
@@ -660,6 +674,9 @@ class Transcriber:
 
     def preload_model(self):
         try:
+            if self.transcription_method == TRANSCRIPTION_METHOD_API:
+                return
+
             with self.model_lock:
                 if self.model is not None:
                     return
@@ -680,6 +697,9 @@ class Transcriber:
 
     def transcribe_file(self, audio_path, speaker_label):
         try:
+            if self.transcription_method == TRANSCRIPTION_METHOD_API:
+                return self._transcribe_file_api(audio_path, speaker_label)
+
             self.preload_model()
 
             self.log(f"文字起こし開始: {speaker_label}")
@@ -717,6 +737,118 @@ class Transcriber:
         except Exception as e:
             write_error_log(f"Transcriber.transcribe_file error: {speaker_label}", e)
             raise
+
+    def _validate_wav_for_api(self, audio_path):
+        path = Path(audio_path)
+        try:
+            with wave.open(str(path), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                if rate <= 0:
+                    raise RuntimeError("サンプルレートが不正です。")
+                duration = frames / rate
+        except Exception as e:
+            raise RuntimeError(f"API送信用WAVを読み込めません: {path} / {e}") from e
+
+        if duration < MIN_API_AUDIO_SECONDS:
+            raise RuntimeError(f"音声が短すぎます: {path} / {duration:.2f}秒")
+
+        self.log(
+            f"API送信WAV確認: {path.name}, {duration:.2f}秒, "
+            f"{rate}Hz, {channels}ch, {sample_width * 8}bit"
+        )
+        return duration
+
+    def _transcribe_file_api(self, audio_path, speaker_label):
+        duration = self._validate_wav_for_api(audio_path)
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY が設定されていません。")
+
+        path = Path(audio_path)
+        self.log(f"API文字起こし開始: {speaker_label}, model={self.api_model}")
+
+        fields = {
+            "model": self.api_model,
+            "language": LANGUAGE,
+            "response_format": "json",
+        }
+        body, content_type = self._build_multipart_body(fields, path)
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/audio/transcriptions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": content_type,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = self._read_api_error(e)
+            raise RuntimeError(
+                f"API文字起こしに失敗しました "
+                f"(HTTP {e.code}, model={self.api_model}, format=json)。詳細: {detail}"
+            ) from e
+
+        text = (payload.get("text") or "").strip()
+        rows = []
+        if text:
+            rows.append({
+                "start": 0.0,
+                "end": duration,
+                "speaker": speaker_label,
+                "text": text,
+            })
+
+        self.log(f"API文字起こし完了: {speaker_label}")
+        return rows
+
+    def _build_multipart_body(self, fields, file_path):
+        boundary = f"----recordapp-{uuid.uuid4().hex}"
+        chunks = []
+
+        for name, value in fields.items():
+            chunks.extend([
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                f"{value}\r\n".encode("utf-8"),
+            ])
+
+        file_bytes = Path(file_path).read_bytes()
+        chunks.extend([
+            f"--{boundary}\r\n".encode("utf-8"),
+            (
+                'Content-Disposition: form-data; name="file"; '
+                f'filename="{Path(file_path).name}"\r\n'
+            ).encode("utf-8"),
+            b"Content-Type: audio/wav\r\n\r\n",
+            file_bytes,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ])
+
+        return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+    def _read_api_error(self, error):
+        try:
+            raw = error.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+            api_error = payload.get("error") or {}
+            parts = [
+                str(api_error.get("message") or "").strip(),
+                str(api_error.get("code") or "").strip(),
+                str(api_error.get("type") or "").strip(),
+            ]
+            detail = " / ".join(part for part in parts if part)
+            return detail or raw
+        except Exception:
+            return str(error)
 
     @staticmethod
     def fmt(sec):
@@ -811,6 +943,7 @@ class App:
         self.status_title_var = tk.StringVar(value="停止中")
         self.status_detail_var = tk.StringVar(value="録音は開始されていません")
         self.current_transcription_var = tk.StringVar(value="文字起こし: 待機中")
+        self.transcription_method_var = tk.StringVar(value=self.app_settings["transcription_method"])
         self.model_var = tk.StringVar(value=MODEL_CHOICES[self.app_settings["model_size"]])
         self.mode_var = tk.StringVar(value=self.app_settings["mode"])
         self.settings_summary_var = tk.StringVar()
@@ -1055,7 +1188,17 @@ class App:
             sticky="w",
             pady=(0, 12),
         )
-        ttk.Label(settings_frame, text="モデル", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(settings_frame, text="文字起こし方式", style="Card.TLabel").grid(row=1, column=0, sticky="w")
+        self.transcription_method_combo = ttk.Combobox(
+            settings_frame,
+            textvariable=self.transcription_method_var,
+            values=[TRANSCRIPTION_METHOD_LOCAL, TRANSCRIPTION_METHOD_API],
+            state="readonly",
+            width=30,
+        )
+        self.transcription_method_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+
+        ttk.Label(settings_frame, text="モデル", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         self.model_combo = ttk.Combobox(
             settings_frame,
             textvariable=self.model_var,
@@ -1063,9 +1206,9 @@ class App:
             state="readonly",
             width=30,
         )
-        self.model_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+        self.model_combo.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
 
-        ttk.Label(settings_frame, text="処理モード", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(settings_frame, text="処理モード", style="Card.TLabel").grid(row=3, column=0, sticky="w")
         self.mode_combo = ttk.Combobox(
             settings_frame,
             textvariable=self.mode_var,
@@ -1073,7 +1216,7 @@ class App:
             state="readonly",
             width=30,
         )
-        self.mode_combo.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+        self.mode_combo.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
 
         ttk.Label(
             settings_frame,
@@ -1081,9 +1224,10 @@ class App:
             style="Muted.Card.TLabel",
             wraplength=340,
             justify="left",
-        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 10))
+        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
         settings_frame.columnconfigure(1, weight=1)
+        self.transcription_method_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.mode_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.refresh_settings_summary()
@@ -1117,7 +1261,8 @@ class App:
         self.add_log(f"録音フォルダ: {BASE_DIR}")
         self.add_log(f"エラーログ: {ERROR_LOG}")
         self.add_log(
-            f"文字起こし設定: model={self.app_settings['model_size']}, "
+            f"文字起こし設定: method={self.app_settings['transcription_method']}, "
+            f"model={self.app_settings['model_size']}, "
             f"mode={self.app_settings['mode']}, beam_size={self.app_settings['beam_size']}, "
             f"compute_type={self.app_settings['compute_type']}"
         )
@@ -1269,25 +1414,41 @@ class App:
     def refresh_settings_summary(self):
         if not hasattr(self, "settings_summary_var"):
             return
+        transcription_method = self.transcription_method_var.get()
         model_size = self.selected_model_size()
         mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
         beam_size = MODE_CHOICES[mode]
-        self.settings_summary_var.set(
-            f"選択中の起動中だけ有効です。次回の文字起こしから反映します。model={model_size}, "
-            f"beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
-            "初回利用時はモデルのダウンロードに時間がかかります。"
-        )
+        if transcription_method == TRANSCRIPTION_METHOD_API:
+            self.settings_summary_var.set(
+                f"OpenAI APIを使います。次回の文字起こしから反映します。"
+                f"model={API_TRANSCRIBE_MODEL}, response_format=json。"
+                "OPENAI_API_KEY が必要です。"
+            )
+        else:
+            self.settings_summary_var.set(
+                f"選択中の起動中だけ有効です。次回の文字起こしから反映します。model={model_size}, "
+                f"beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
+                "初回利用時はモデルのダウンロードに時間がかかります。"
+            )
 
     def on_transcription_setting_changed(self, event=None):
         if self.transcription_running:
+            self.transcription_method_var.set(self.app_settings["transcription_method"])
             self.model_var.set(MODEL_CHOICES[self.app_settings["model_size"]])
             self.mode_var.set(self.app_settings["mode"])
             self.refresh_settings_summary()
             safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に変更してください。")
             return
 
+        transcription_method = self.transcription_method_var.get()
+        if transcription_method not in (TRANSCRIPTION_METHOD_LOCAL, TRANSCRIPTION_METHOD_API):
+            transcription_method = DEFAULT_SETTINGS["transcription_method"]
+            self.transcription_method_var.set(transcription_method)
+
         mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
         settings = {
+            "transcription_method": transcription_method,
+            "api_model": API_TRANSCRIBE_MODEL,
             "model_size": self.selected_model_size(),
             "mode": mode,
             "beam_size": MODE_CHOICES[mode],
@@ -1298,7 +1459,7 @@ class App:
         self.transcriber.set_settings(settings)
         self.refresh_settings_summary()
         self.add_log(
-            f"文字起こし設定を変更: model={settings['model_size']}, "
+            f"文字起こし設定を変更: method={settings['transcription_method']}, model={settings['model_size']}, "
             f"mode={settings['mode']}, beam_size={settings['beam_size']}"
         )
 
