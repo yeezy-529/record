@@ -13,6 +13,8 @@ import ctypes
 import mimetypes
 import uuid
 import urllib.request
+import urllib.error
+import time
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -805,8 +807,40 @@ class Transcriber:
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
             },
         )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+
+        # リトライは最小限: 502 のみ 1 回だけ再試行する
+        retry_wait_seconds = [1]
+        last_error = None
+        payload = None
+
+        for attempt in range(1, len(retry_wait_seconds) + 2):
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if int(e.code) == 502 and attempt <= len(retry_wait_seconds):
+                    wait_sec = retry_wait_seconds[attempt - 1]
+                    self.log(
+                        f"API文字起こし一時エラー(HTTP {e.code})のため{wait_sec}秒後に再試行します: {speaker_label}"
+                    )
+                    time.sleep(wait_sec)
+                    continue
+                detail = ""
+                try:
+                    detail = (e.read() or b"").decode("utf-8", errors="replace")
+                except Exception:
+                    detail = ""
+                if detail:
+                    raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code}): {detail}") from e
+                raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code})") from e
+            except urllib.error.URLError as e:
+                last_error = e
+                raise RuntimeError(f"文字起こしAPI接続エラー: {e}") from e
+
+        if payload is None:
+            raise RuntimeError("文字起こしAPIから有効なレスポンスを受け取れませんでした。") from last_error
 
         rows = []
         for seg in payload.get("segments", []) or []:
