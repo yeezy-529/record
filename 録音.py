@@ -769,6 +769,11 @@ class Transcriber:
 
         path = Path(audio_path)
         self.log(f"API文字起こし開始: {speaker_label}, model={self.api_model}")
+        file_size = path.stat().st_size if path.exists() else 0
+        self.log(
+            f"API送信情報: model={self.api_model}, response_format=json, "
+            f"file={path.name}, size={file_size} bytes, duration={duration:.2f}秒"
+        )
 
         fields = {
             "model": self.api_model,
@@ -790,7 +795,10 @@ class Transcriber:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            detail = self._read_api_error(e)
+            detail, raw = self._read_api_error(e)
+            self.log(f"APIエラー詳細: HTTP {e.code} {e.reason}: {detail}")
+            if raw:
+                self.log(f"APIエラー本文: {raw[:500]}")
             raise RuntimeError(
                 f"API文字起こしに失敗しました "
                 f"(HTTP {e.code}, model={self.api_model}, format=json)。詳細: {detail}"
@@ -838,6 +846,9 @@ class Transcriber:
     def _read_api_error(self, error):
         try:
             raw = error.read().decode("utf-8", errors="replace")
+            if not raw:
+                return f"HTTP {error.code} {error.reason}: response body empty", ""
+
             payload = json.loads(raw)
             api_error = payload.get("error") or {}
             parts = [
@@ -846,9 +857,11 @@ class Transcriber:
                 str(api_error.get("type") or "").strip(),
             ]
             detail = " / ".join(part for part in parts if part)
-            return detail or raw
+            return detail or raw[:500], raw
+        except json.JSONDecodeError:
+            return raw[:500] if raw else str(error), raw
         except Exception:
-            return str(error)
+            return str(error), ""
 
     @staticmethod
     def fmt(sec):
@@ -1260,6 +1273,7 @@ class App:
         self.add_log("アプリを起動しました。")
         self.add_log(f"録音フォルダ: {BASE_DIR}")
         self.add_log(f"エラーログ: {ERROR_LOG}")
+        self.add_log(f"API文字起こし実装: model={API_TRANSCRIBE_MODEL}, response_format=json")
         self.add_log(
             f"文字起こし設定: method={self.app_settings['transcription_method']}, "
             f"model={self.app_settings['model_size']}, "
