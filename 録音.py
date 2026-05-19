@@ -15,6 +15,7 @@ import uuid
 import urllib.request
 import urllib.error
 import time
+import tempfile
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -753,11 +754,11 @@ class Transcriber:
                     if not text:
                         continue
 
-                    rows.append({
+                        rows.append({
                         "start": float(seg.start),
                         "end": float(seg.end),
-                        "speaker": speaker_label,
-                        "text": text,
+                            "speaker": speaker_label,
+                            "text": text,
                     })
 
             self.log(f"文字起こし完了: {speaker_label}")
@@ -766,6 +767,40 @@ class Transcriber:
         except Exception as e:
             write_error_log(f"Transcriber.transcribe_file error: {speaker_label}", e)
             raise
+
+    @staticmethod
+    def _prepare_api_audio_file(audio_path):
+        audio_path = Path(audio_path)
+        with wave.open(str(audio_path), "rb") as wf:
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            framerate = wf.getframerate()
+            pcm = wf.readframes(wf.getnframes())
+
+        if sample_width != 2:
+            raise RuntimeError(f"未対応のWAVビット深度です: {sample_width * 8}bit ({audio_path.name})")
+
+        if channels > 1:
+            pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
+
+        target_rate = 16000
+        if framerate != target_rate:
+            pcm, _ = audioop.ratecv(pcm, sample_width, 1, framerate, target_rate, None)
+
+        if not pcm:
+            raise RuntimeError(f"音声データ変換後にデータが空です: {audio_path.name}")
+
+        tmp = tempfile.NamedTemporaryFile(prefix="record_api_", suffix=".wav", delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+
+        with wave.open(str(tmp_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(target_rate)
+            wf.writeframes(pcm)
+
+        return tmp_path
 
     def _transcribe_file_api(self, audio_path, speaker_label):
         api_key = (self.openai_api_key or "").strip()
@@ -787,8 +822,9 @@ class Transcriber:
         except wave.Error as e:
             raise RuntimeError(f"音声ファイル形式を読み取れません: {audio_path.name}") from e
 
-        audio_bytes = audio_path.read_bytes()
-        mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
+        api_audio_path = self._prepare_api_audio_file(audio_path)
+        audio_bytes = api_audio_path.read_bytes()
+        mime_type = "audio/wav"
 
         parts = []
 
@@ -803,7 +839,7 @@ class Transcriber:
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
-            f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode("utf-8")
+            f'Content-Disposition: form-data; name="file"; filename="{api_audio_path.name}"\r\n'.encode("utf-8")
         )
         parts.append(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
         parts.append(audio_bytes)
@@ -811,77 +847,83 @@ class Transcriber:
         parts.append(f"--{boundary}--\r\n".encode("utf-8"))
         body = b"".join(parts)
 
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/audio/transcriptions",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-        )
+        try:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/audio/transcriptions",
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            )
 
-        # リトライは最小限: 502 のみ 1 回だけ再試行する
-        retry_wait_seconds = [1]
-        last_error = None
-        payload = None
+            # リトライは最小限: 502 のみ 1 回だけ再試行する
+            retry_wait_seconds = [1]
+            last_error = None
+            payload = None
 
-        for attempt in range(1, len(retry_wait_seconds) + 2):
-            try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as e:
-                last_error = e
-                if int(e.code) == 502 and attempt <= len(retry_wait_seconds):
-                    wait_sec = retry_wait_seconds[attempt - 1]
-                    self.log(
-                        f"API文字起こし一時エラー(HTTP {e.code})のため{wait_sec}秒後に再試行します: {speaker_label}"
-                    )
-                    time.sleep(wait_sec)
-                    continue
-                detail = ""
+            for attempt in range(1, len(retry_wait_seconds) + 2):
                 try:
-                    detail = (e.read() or b"").decode("utf-8", errors="replace")
-                except Exception:
+                    with urllib.request.urlopen(req, timeout=600) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                    break
+                except urllib.error.HTTPError as e:
+                    last_error = e
+                    if int(e.code) == 502 and attempt <= len(retry_wait_seconds):
+                        wait_sec = retry_wait_seconds[attempt - 1]
+                        self.log(
+                            f"API文字起こし一時エラー(HTTP {e.code})のため{wait_sec}秒後に再試行します: {speaker_label}"
+                        )
+                        time.sleep(wait_sec)
+                        continue
                     detail = ""
-                if int(e.code) == 400:
                     try:
-                        err_json = json.loads(detail) if detail else {}
+                        detail = (e.read() or b"").decode("utf-8", errors="replace")
                     except Exception:
-                        err_json = {}
-                    message = ((err_json.get("error") or {}).get("message") or "").strip()
-                    if message:
+                        detail = ""
+                    if int(e.code) == 400:
+                        try:
+                            err_json = json.loads(detail) if detail else {}
+                        except Exception:
+                            err_json = {}
+                        message = ((err_json.get("error") or {}).get("message") or "").strip()
+                        if message:
+                            raise RuntimeError(
+                                "文字起こしAPIエラー(HTTP 400): "
+                                f"{message} / ファイル形式・録音内容を確認してください（WAVが空/破損/形式不一致の可能性）"
+                            ) from e
                         raise RuntimeError(
-                            "文字起こしAPIエラー(HTTP 400): "
-                            f"{message} / ファイル形式・録音内容を確認してください（WAVが空/破損の可能性）"
+                            "文字起こしAPIエラー(HTTP 400): リクエスト不正です。"
+                            "ファイル形式・録音内容を確認してください（WAVが空/破損/形式不一致の可能性）"
                         ) from e
-                    raise RuntimeError(
-                        "文字起こしAPIエラー(HTTP 400): リクエスト不正です。"
-                        "ファイル形式・録音内容を確認してください（WAVが空/破損の可能性）"
-                    ) from e
-                if detail:
-                    raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code}): {detail}") from e
-                raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code})") from e
-            except urllib.error.URLError as e:
-                last_error = e
-                raise RuntimeError(f"文字起こしAPI接続エラー: {e}") from e
+                    if detail:
+                        raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code}): {detail}") from e
+                    raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code})") from e
+                except urllib.error.URLError as e:
+                    last_error = e
+                    raise RuntimeError(f"文字起こしAPI接続エラー: {e}") from e
 
-        if payload is None:
-            raise RuntimeError("文字起こしAPIから有効なレスポンスを受け取れませんでした。") from last_error
+            if payload is None:
+                raise RuntimeError("文字起こしAPIから有効なレスポンスを受け取れませんでした。") from last_error
 
-        rows = []
-        for seg in payload.get("segments", []) or []:
-            text = (seg.get("text", "") or "").strip()
-            if not text:
-                continue
-            rows.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "speaker": speaker_label,
-                "text": text,
-            })
-        return rows
+            rows = []
+            for seg in payload.get("segments", []) or []:
+                text = (seg.get("text", "") or "").strip()
+                if not text:
+                    continue
+                rows.append({
+                    "start": float(seg.get("start", 0.0)),
+                    "end": float(seg.get("end", 0.0)),
+                    "speaker": speaker_label,
+                    "text": text,
+                })
+            return rows
+        finally:
+            try:
+                api_audio_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     @staticmethod
     def fmt(sec):
