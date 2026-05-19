@@ -12,6 +12,8 @@ import wave
 import ctypes
 import mimetypes
 import uuid
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from datetime import datetime
@@ -805,8 +807,39 @@ class Transcriber:
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
             },
         )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        max_attempts = 4
+        backoff_seconds = 2
+        last_error = None
+        payload = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code not in {429, 500, 502, 503, 504} or attempt >= max_attempts:
+                    raise
+                wait_sec = backoff_seconds * (2 ** (attempt - 1))
+                self.log(
+                    f"API文字起こし一時エラー(HTTP {e.code})。{wait_sec}秒後に再試行します "
+                    f"({attempt}/{max_attempts}): {speaker_label}"
+                )
+                time.sleep(wait_sec)
+            except urllib.error.URLError as e:
+                last_error = e
+                if attempt >= max_attempts:
+                    raise
+                wait_sec = backoff_seconds * (2 ** (attempt - 1))
+                self.log(
+                    f"API通信エラー。{wait_sec}秒後に再試行します "
+                    f"({attempt}/{max_attempts}): {speaker_label}"
+                )
+                time.sleep(wait_sec)
+
+        if payload is None and last_error is not None:
+            raise last_error
 
         rows = []
         for seg in payload.get("segments", []) or []:
