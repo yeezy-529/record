@@ -728,6 +728,47 @@ class Transcriber:
             write_error_log("Transcriber.preload_model error", e)
             raise
 
+    def _transcribe_file_local(self, audio_path, speaker_label):
+        if self.model_size in API_TRANSCRIBE_MODELS:
+            with self.model_lock:
+                if self.model is None:
+                    fallback_model_size = "large-v3"
+                    self.log(f"API失敗時フォールバックモデルを読み込み中: {fallback_model_size}")
+                    self.model = WhisperModel(
+                        fallback_model_size,
+                        device="cpu",
+                        compute_type=self.compute_type
+                    )
+                    self.log("フォールバックモデル読み込み完了。")
+        else:
+            self.preload_model()
+
+        segments, info = self.model.transcribe(
+            str(audio_path),
+            language=LANGUAGE,
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=500
+            ),
+            beam_size=self.beam_size,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+        )
+
+        rows = []
+        for seg in segments:
+            text = (seg.text or "").strip()
+            if not text:
+                continue
+            rows.append({
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "speaker": speaker_label,
+                "text": text,
+            })
+        return rows
+
     def transcribe_file(self, audio_path, speaker_label):
         try:
             self.log(f"文字起こし開始: {speaker_label}")
