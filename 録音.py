@@ -812,6 +812,27 @@ class Transcriber:
         last_error = None
         payload = None
 
+        def _read_http_error_detail(http_error):
+            try:
+                raw = http_error.read()
+                if not raw:
+                    return ""
+                text = raw.decode("utf-8", errors="replace").strip()
+                if not text:
+                    return ""
+                try:
+                    data = json.loads(text)
+                    err = data.get("error", {}) if isinstance(data, dict) else {}
+                    message = (err.get("message", "") or "").strip()
+                    code = (err.get("code", "") or "").strip()
+                    type_name = (err.get("type", "") or "").strip()
+                    parts = [p for p in [message, code, type_name] if p]
+                    return " / ".join(parts) if parts else text
+                except Exception:
+                    return text
+            except Exception:
+                return ""
+
         for attempt in range(1, max_attempts + 1):
             try:
                 with urllib.request.urlopen(req, timeout=600) as resp:
@@ -819,12 +840,18 @@ class Transcriber:
                 break
             except urllib.error.HTTPError as e:
                 last_error = e
-                if e.code not in {429, 500, 502, 503, 504} or attempt >= max_attempts:
-                    raise
+                error_detail = _read_http_error_detail(e)
+                is_retryable = e.code in {429, 500, 502, 503, 504}
+                if not is_retryable or attempt >= max_attempts:
+                    detail_msg = f" 詳細: {error_detail}" if error_detail else ""
+                    raise RuntimeError(
+                        f"API文字起こしに失敗しました (HTTP {e.code}, model={self.model_size}).{detail_msg}"
+                    ) from e
                 wait_sec = backoff_seconds * (2 ** (attempt - 1))
+                detail_msg = f" / {error_detail}" if error_detail else ""
                 self.log(
                     f"API文字起こし一時エラー(HTTP {e.code})。{wait_sec}秒後に再試行します "
-                    f"({attempt}/{max_attempts}): {speaker_label}"
+                    f"({attempt}/{max_attempts}): {speaker_label}{detail_msg}"
                 )
                 time.sleep(wait_sec)
             except urllib.error.URLError as e:
