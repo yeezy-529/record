@@ -774,6 +774,7 @@ class Transcriber:
 
         audio_path = Path(audio_path)
         upload_audio_path = audio_path
+        temp_audio_path = None
 
         def _prepare_audio_for_api(src_path):
             converted_path = src_path.with_name(f"{src_path.stem}_api.wav")
@@ -800,6 +801,18 @@ class Transcriber:
                 err = result.stderr.decode("utf-8", errors="replace").strip()
                 raise RuntimeError(f"ffmpeg変換失敗: {err}")
             return converted_path
+
+        def _inspect_wav(path_obj):
+            try:
+                with wave.open(str(path_obj), "rb") as wf:
+                    return {
+                        "channels": wf.getnchannels(),
+                        "rate": wf.getframerate(),
+                        "width": wf.getsampwidth(),
+                        "frames": wf.getnframes(),
+                    }
+            except Exception:
+                return None
 
         def _build_request(send_audio_path, response_format):
             audio_bytes = send_audio_path.read_bytes()
@@ -861,100 +874,110 @@ class Transcriber:
             except Exception:
                 return ""
 
-        response_formats = ["json", "verbose_json"]
-        used_response_format = response_formats[0]
-        attempted_audio_convert = False
+        try:
+            # gpt-4o系モデルはverbose_json非対応のため、json/textのみ利用する
+            response_formats = ["json", "text"]
+            used_response_format = response_formats[0]
+            attempted_audio_convert = False
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                req = _build_request(upload_audio_path, used_response_format)
-                with urllib.request.urlopen(req, timeout=600) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as e:
-                last_error = e
-                error_detail = _read_http_error_detail(e)
-                if (
-                    e.code == 400
-                    and "response_format" in (error_detail or "")
-                    and attempt == 1
-                ):
-                    if used_response_format == "verbose_json":
-                        used_response_format = "json"
-                    elif used_response_format == "json":
-                        used_response_format = "text"
-                    else:
-                        used_response_format = "json"
-                    self.log(
-                        f"API文字起こし形式を切替えて再試行します ({used_response_format}): {speaker_label}"
-                    )
-                    continue
-                if (
-                    e.code == 400
-                    and not attempted_audio_convert
-                    and ("Audio file might be corrupted or unsupported" in (error_detail or ""))
-                ):
-                    attempted_audio_convert = True
-                    upload_audio_path = _prepare_audio_for_api(audio_path)
-                    self.log(
-                        f"音声形式エラーのため16kHzモノラルWAVへ変換して再試行します: {speaker_label}"
-                    )
-                    continue
-                is_retryable = e.code in {429, 500, 502, 503, 504}
-                if not is_retryable or attempt >= max_attempts:
-                    detail_msg = f" 詳細: {error_detail}" if error_detail else ""
-                    raise RuntimeError(
-                        f"API文字起こしに失敗しました (HTTP {e.code}, model={self.model_size}, format={used_response_format}).{detail_msg}"
-                    ) from e
-                wait_sec = backoff_seconds * (2 ** (attempt - 1))
-                detail_msg = f" / {error_detail}" if error_detail else ""
+            # API送信前に安全なPCM16モノラル16kHz WAVへ正規化（壊れ/非対応形式を避ける）
+            temp_audio_path = _prepare_audio_for_api(audio_path)
+            upload_audio_path = temp_audio_path
+            meta = _inspect_wav(upload_audio_path)
+            if meta:
                 self.log(
-                    f"API文字起こし一時エラー(HTTP {e.code})。{wait_sec}秒後に再試行します "
-                    f"({attempt}/{max_attempts}): {speaker_label}{detail_msg}"
+                    f"API送信用音声: ch={meta['channels']} rate={meta['rate']} width={meta['width']} frames={meta['frames']} ({speaker_label})"
                 )
-                time.sleep(wait_sec)
-            except urllib.error.URLError as e:
-                last_error = e
-                if attempt >= max_attempts:
-                    raise
-                wait_sec = backoff_seconds * (2 ** (attempt - 1))
-                self.log(
-                    f"API通信エラー。{wait_sec}秒後に再試行します "
-                    f"({attempt}/{max_attempts}): {speaker_label}"
-                )
-                time.sleep(wait_sec)
 
-        if payload is None and last_error is not None:
-            raise last_error
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    req = _build_request(upload_audio_path, used_response_format)
+                    with urllib.request.urlopen(req, timeout=600) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                    break
+                except urllib.error.HTTPError as e:
+                    last_error = e
+                    error_detail = _read_http_error_detail(e)
+                    if (
+                        e.code == 400
+                        and "response_format" in (error_detail or "")
+                        and attempt == 1
+                    ):
+                        if used_response_format == "json":
+                            used_response_format = "text"
+                        else:
+                            used_response_format = "json"
+                        self.log(
+                            f"API文字起こし形式を切替えて再試行します ({used_response_format}): {speaker_label}"
+                        )
+                        continue
+                    if (
+                        e.code == 400
+                        and not attempted_audio_convert
+                        and ("Audio file might be corrupted or unsupported" in (error_detail or ""))
+                    ):
+                        attempted_audio_convert = True
+                        upload_audio_path = _prepare_audio_for_api(audio_path)
+                        self.log(
+                            f"音声形式エラーのため16kHzモノラルWAVへ変換して再試行します: {speaker_label}"
+                        )
+                        continue
+                    is_retryable = e.code in {429, 500, 502, 503, 504}
+                    if not is_retryable or attempt >= max_attempts:
+                        detail_msg = f" 詳細: {error_detail}" if error_detail else ""
+                        raise RuntimeError(
+                            f"API文字起こしに失敗しました (HTTP {e.code}, model={self.model_size}, format={used_response_format}).{detail_msg}"
+                        ) from e
+                    wait_sec = backoff_seconds * (2 ** (attempt - 1))
+                    detail_msg = f" / {error_detail}" if error_detail else ""
+                    self.log(
+                        f"API文字起こし一時エラー(HTTP {e.code})。{wait_sec}秒後に再試行します "
+                        f"({attempt}/{max_attempts}): {speaker_label}{detail_msg}"
+                    )
+                    time.sleep(wait_sec)
+                except urllib.error.URLError as e:
+                    last_error = e
+                    if attempt >= max_attempts:
+                        raise
+                    wait_sec = backoff_seconds * (2 ** (attempt - 1))
+                    self.log(
+                        f"API通信エラー。{wait_sec}秒後に再試行します "
+                        f"({attempt}/{max_attempts}): {speaker_label}"
+                    )
+                    time.sleep(wait_sec)
 
-        rows = []
-        segments = payload.get("segments", []) or []
-        if segments:
-            for seg in segments:
-                text = (seg.get("text", "") or "").strip()
-                if not text:
-                    continue
-                rows.append({
-                    "start": float(seg.get("start", 0.0)),
-                    "end": float(seg.get("end", 0.0)),
-                    "speaker": speaker_label,
-                    "text": text,
-                })
-        else:
-            text = (payload.get("text", "") or "").strip()
-            if text:
-                rows.append({
-                    "start": 0.0,
-                    "end": 0.0,
-                    "speaker": speaker_label,
-                    "text": text,
-                })
-        if upload_audio_path != audio_path and upload_audio_path.exists():
-            try:
-                upload_audio_path.unlink()
-            except Exception:
-                pass
-        return rows
+            if payload is None and last_error is not None:
+                raise last_error
+
+            rows = []
+            segments = payload.get("segments", []) or []
+            if segments:
+                for seg in segments:
+                    text = (seg.get("text", "") or "").strip()
+                    if not text:
+                        continue
+                    rows.append({
+                        "start": float(seg.get("start", 0.0)),
+                        "end": float(seg.get("end", 0.0)),
+                        "speaker": speaker_label,
+                        "text": text,
+                    })
+            else:
+                text = (payload.get("text", "") or "").strip()
+                if text:
+                    rows.append({
+                        "start": 0.0,
+                        "end": 0.0,
+                        "speaker": speaker_label,
+                        "text": text,
+                    })
+            return rows
+        finally:
+            if temp_audio_path is not None and temp_audio_path.exists():
+                try:
+                    temp_audio_path.unlink()
+                except Exception:
+                    pass
 
     @staticmethod
     def fmt(sec):
