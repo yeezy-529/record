@@ -788,34 +788,10 @@ class Transcriber:
     @staticmethod
     def _prepare_api_audio_file(audio_path):
         audio_path = Path(audio_path)
-        with wave.open(str(audio_path), "rb") as wf:
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            framerate = wf.getframerate()
-            pcm = wf.readframes(wf.getnframes())
-
-        if sample_width != 2:
-            raise RuntimeError(f"未対応のWAVビット深度です: {sample_width * 8}bit ({audio_path.name})")
-
-        if channels > 1:
-            pcm = audioop.tomono(pcm, sample_width, 0.5, 0.5)
-
-        target_rate = 16000
-        if framerate != target_rate:
-            pcm, _ = audioop.ratecv(pcm, sample_width, 1, framerate, target_rate, None)
-
-        if not pcm:
-            raise RuntimeError(f"音声データ変換後にデータが空です: {audio_path.name}")
-
-        wav_tmp = tempfile.NamedTemporaryFile(prefix="record_api_", suffix=".wav", delete=False)
-        wav_tmp_path = Path(wav_tmp.name)
-        wav_tmp.close()
-
-        with wave.open(str(wav_tmp_path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(target_rate)
-            wf.writeframes(pcm)
+        if not audio_path.exists():
+            raise RuntimeError(f"音声ファイルが見つかりません: {audio_path}")
+        if audio_path.stat().st_size <= 0:
+            raise RuntimeError(f"音声ファイルが空です: {audio_path.name}")
 
         m4a_tmp = tempfile.NamedTemporaryFile(prefix="record_api_", suffix=".m4a", delete=False)
         m4a_tmp_path = Path(m4a_tmp.name)
@@ -825,21 +801,27 @@ class Transcriber:
             "ffmpeg",
             "-y",
             "-i",
-            str(wav_tmp_path),
+            str(audio_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
             "-c:a",
             "aac",
             "-b:a",
             "96k",
             str(m4a_tmp_path),
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except Exception as e:
+            raise RuntimeError(f"API送信用音声の変換に失敗しました: {audio_path.name}") from e
+
         if not m4a_tmp_path.exists() or m4a_tmp_path.stat().st_size <= 0:
             raise RuntimeError("API送信用音声(m4a)の生成に失敗しました。")
-        try:
-            wav_tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+
         return m4a_tmp_path, "audio/mp4"
+
 
     def _transcribe_file_api(self, audio_path, speaker_label):
         api_key = (self.openai_api_key or "").strip()
@@ -850,16 +832,8 @@ class Transcriber:
         audio_path = Path(audio_path)
         if not audio_path.exists():
             raise RuntimeError(f"音声ファイルが見つかりません: {audio_path}")
-        if audio_path.stat().st_size <= 44:
+        if audio_path.stat().st_size <= 0:
             raise RuntimeError(f"音声ファイルが空、または不正です: {audio_path.name}")
-        try:
-            with wave.open(str(audio_path), "rb") as wf:
-                nframes = wf.getnframes()
-                framerate = wf.getframerate() or 0
-            if nframes <= 0 or framerate <= 0:
-                raise RuntimeError(f"音声ファイルに有効な音声データがありません: {audio_path.name}")
-        except wave.Error as e:
-            raise RuntimeError(f"音声ファイル形式を読み取れません: {audio_path.name}") from e
 
         api_audio_path, mime_type = self._prepare_api_audio_file(audio_path)
         audio_bytes = api_audio_path.read_bytes()
@@ -1783,20 +1757,40 @@ class App:
         self.status_var.set(f"文字起こし中: {job_name}")
         self.refresh_status_banner()
 
+    def _convert_wav_pair_to_m4a(self, folder):
+        folder = Path(folder)
+        out = {}
+        for stem in ["system", "mic"]:
+            wav_path = folder / f"{stem}.wav"
+            m4a_path = folder / f"{stem}.m4a"
+            if wav_path.exists() and not m4a_path.exists():
+                try:
+                    cmd = [
+                        "ffmpeg", "-y", "-i", str(wav_path),
+                        "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "96k", str(m4a_path)
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    self.add_log(f"{stem}.wav を {stem}.m4a に変換しました: {m4a_path}")
+                except Exception as e:
+                    write_error_log("App._convert_wav_pair_to_m4a error", e)
+            out[stem] = m4a_path if m4a_path.exists() else wav_path
+        return out
+
     def add_queue_from_dialog(self):
         folder = filedialog.askdirectory(title="文字起こし対象フォルダを選択")
         if not folder:
             return
         folder = Path(folder)
+        converted = self._convert_wav_pair_to_m4a(folder)
         job = {
             "output_dir": folder,
-            "system_wav": folder / "system.wav",
-            "mic_wav": folder / "mic.wav",
+            "system_wav": converted["system"],
+            "mic_wav": converted["mic"],
             "txt_out": self.transcript_txt_path(folder),
             "memo_path": folder / "memo.txt",
         }
         if not job["system_wav"].exists() or not job["mic_wav"].exists():
-            safe_messagebox_error("エラー", "system.wav と mic.wav が見つかりません。")
+            safe_messagebox_error("エラー", "system/mic の音声ファイル（wav または m4a）が見つかりません。")
             return
         self.enqueue_transcription_job(job)
 
