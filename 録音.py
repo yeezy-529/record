@@ -834,7 +834,7 @@ class Transcriber:
             except Exception:
                 return ""
 
-        response_formats = ["verbose_json", "json"]
+        response_formats = ["json", "verbose_json"]
         used_response_format = response_formats[0]
 
         for attempt in range(1, max_attempts + 1):
@@ -848,12 +848,17 @@ class Transcriber:
                 error_detail = _read_http_error_detail(e)
                 if (
                     e.code == 400
-                    and used_response_format == "verbose_json"
+                    and "response_format" in (error_detail or "")
                     and attempt == 1
                 ):
-                    used_response_format = "json"
+                    if used_response_format == "verbose_json":
+                        used_response_format = "json"
+                    elif used_response_format == "json":
+                        used_response_format = "text"
+                    else:
+                        used_response_format = "json"
                     self.log(
-                        f"API文字起こし形式をverbose_jsonからjsonに切替えて再試行します: {speaker_label}"
+                        f"API文字起こし形式を切替えて再試行します ({used_response_format}): {speaker_label}"
                     )
                     continue
                 is_retryable = e.code in {429, 500, 502, 503, 504}
