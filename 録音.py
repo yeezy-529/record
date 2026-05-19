@@ -772,41 +772,42 @@ class Transcriber:
         if not api_key:
             raise RuntimeError("APIモデル利用時はOpenAI APIキーを入力してください。")
 
-        boundary = f"----recordapp{uuid.uuid4().hex}"
         audio_path = Path(audio_path)
         audio_bytes = audio_path.read_bytes()
         mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
 
-        parts = []
+        def _build_request(response_format):
+            boundary = f"----recordapp{uuid.uuid4().hex}"
+            parts = []
 
-        def add_field(name, value):
+            def add_field(name, value):
+                parts.append(f"--{boundary}\r\n".encode("utf-8"))
+                parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+                parts.append(f"{value}\r\n".encode("utf-8"))
+
+            add_field("model", self.model_size)
+            add_field("language", LANGUAGE)
+            add_field("response_format", response_format)
+
             parts.append(f"--{boundary}\r\n".encode("utf-8"))
-            parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-            parts.append(f"{value}\r\n".encode("utf-8"))
+            parts.append(
+                f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode("utf-8")
+            )
+            parts.append(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
+            parts.append(audio_bytes)
+            parts.append(b"\r\n")
+            parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+            body = b"".join(parts)
 
-        add_field("model", self.model_size)
-        add_field("language", LANGUAGE)
-        add_field("response_format", "verbose_json")
-
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append(
-            f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode("utf-8")
-        )
-        parts.append(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
-        parts.append(audio_bytes)
-        parts.append(b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/audio/transcriptions",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-        )
+            return urllib.request.Request(
+                "https://api.openai.com/v1/audio/transcriptions",
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            )
         max_attempts = 4
         backoff_seconds = 2
         last_error = None
@@ -833,19 +834,33 @@ class Transcriber:
             except Exception:
                 return ""
 
+        response_formats = ["verbose_json", "json"]
+        used_response_format = response_formats[0]
+
         for attempt in range(1, max_attempts + 1):
             try:
+                req = _build_request(used_response_format)
                 with urllib.request.urlopen(req, timeout=600) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as e:
                 last_error = e
                 error_detail = _read_http_error_detail(e)
+                if (
+                    e.code == 400
+                    and used_response_format == "verbose_json"
+                    and attempt == 1
+                ):
+                    used_response_format = "json"
+                    self.log(
+                        f"API文字起こし形式をverbose_jsonからjsonに切替えて再試行します: {speaker_label}"
+                    )
+                    continue
                 is_retryable = e.code in {429, 500, 502, 503, 504}
                 if not is_retryable or attempt >= max_attempts:
                     detail_msg = f" 詳細: {error_detail}" if error_detail else ""
                     raise RuntimeError(
-                        f"API文字起こしに失敗しました (HTTP {e.code}, model={self.model_size}).{detail_msg}"
+                        f"API文字起こしに失敗しました (HTTP {e.code}, model={self.model_size}, format={used_response_format}).{detail_msg}"
                     ) from e
                 wait_sec = backoff_seconds * (2 ** (attempt - 1))
                 detail_msg = f" / {error_detail}" if error_detail else ""
@@ -869,16 +884,27 @@ class Transcriber:
             raise last_error
 
         rows = []
-        for seg in payload.get("segments", []) or []:
-            text = (seg.get("text", "") or "").strip()
-            if not text:
-                continue
-            rows.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "speaker": speaker_label,
-                "text": text,
-            })
+        segments = payload.get("segments", []) or []
+        if segments:
+            for seg in segments:
+                text = (seg.get("text", "") or "").strip()
+                if not text:
+                    continue
+                rows.append({
+                    "start": float(seg.get("start", 0.0)),
+                    "end": float(seg.get("end", 0.0)),
+                    "speaker": speaker_label,
+                    "text": text,
+                })
+        else:
+            text = (payload.get("text", "") or "").strip()
+            if text:
+                rows.append({
+                    "start": 0.0,
+                    "end": 0.0,
+                    "speaker": speaker_label,
+                    "text": text,
+                })
         return rows
 
     @staticmethod
