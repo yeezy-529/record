@@ -773,10 +773,37 @@ class Transcriber:
             raise RuntimeError("APIモデル利用時はOpenAI APIキーを入力してください。")
 
         audio_path = Path(audio_path)
-        audio_bytes = audio_path.read_bytes()
-        mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
+        upload_audio_path = audio_path
 
-        def _build_request(response_format):
+        def _prepare_audio_for_api(src_path):
+            converted_path = src_path.with_name(f"{src_path.stem}_api.wav")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(converted_path),
+            ]
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                err = result.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"ffmpeg変換失敗: {err}")
+            return converted_path
+
+        def _build_request(send_audio_path, response_format):
+            audio_bytes = send_audio_path.read_bytes()
+            mime_type = mimetypes.guess_type(str(send_audio_path))[0] or "application/octet-stream"
             boundary = f"----recordapp{uuid.uuid4().hex}"
             parts = []
 
@@ -791,7 +818,7 @@ class Transcriber:
 
             parts.append(f"--{boundary}\r\n".encode("utf-8"))
             parts.append(
-                f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode("utf-8")
+                f'Content-Disposition: form-data; name="file"; filename="{send_audio_path.name}"\r\n'.encode("utf-8")
             )
             parts.append(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
             parts.append(audio_bytes)
@@ -836,10 +863,11 @@ class Transcriber:
 
         response_formats = ["json", "verbose_json"]
         used_response_format = response_formats[0]
+        attempted_audio_convert = False
 
         for attempt in range(1, max_attempts + 1):
             try:
-                req = _build_request(used_response_format)
+                req = _build_request(upload_audio_path, used_response_format)
                 with urllib.request.urlopen(req, timeout=600) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 break
@@ -859,6 +887,17 @@ class Transcriber:
                         used_response_format = "json"
                     self.log(
                         f"API文字起こし形式を切替えて再試行します ({used_response_format}): {speaker_label}"
+                    )
+                    continue
+                if (
+                    e.code == 400
+                    and not attempted_audio_convert
+                    and ("Audio file might be corrupted or unsupported" in (error_detail or ""))
+                ):
+                    attempted_audio_convert = True
+                    upload_audio_path = _prepare_audio_for_api(audio_path)
+                    self.log(
+                        f"音声形式エラーのため16kHzモノラルWAVへ変換して再試行します: {speaker_label}"
                     )
                     continue
                 is_retryable = e.code in {429, 500, 502, 503, 504}
@@ -910,6 +949,11 @@ class Transcriber:
                     "speaker": speaker_label,
                     "text": text,
                 })
+        if upload_audio_path != audio_path and upload_audio_path.exists():
+            try:
+                upload_audio_path.unlink()
+            except Exception:
+                pass
         return rows
 
     @staticmethod
