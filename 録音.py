@@ -774,6 +774,19 @@ class Transcriber:
 
         boundary = f"----recordapp{uuid.uuid4().hex}"
         audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise RuntimeError(f"音声ファイルが見つかりません: {audio_path}")
+        if audio_path.stat().st_size <= 44:
+            raise RuntimeError(f"音声ファイルが空、または不正です: {audio_path.name}")
+        try:
+            with wave.open(str(audio_path), "rb") as wf:
+                nframes = wf.getnframes()
+                framerate = wf.getframerate() or 0
+            if nframes <= 0 or framerate <= 0:
+                raise RuntimeError(f"音声ファイルに有効な音声データがありません: {audio_path.name}")
+        except wave.Error as e:
+            raise RuntimeError(f"音声ファイル形式を読み取れません: {audio_path.name}") from e
+
         audio_bytes = audio_path.read_bytes()
         mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
 
@@ -832,6 +845,21 @@ class Transcriber:
                     detail = (e.read() or b"").decode("utf-8", errors="replace")
                 except Exception:
                     detail = ""
+                if int(e.code) == 400:
+                    try:
+                        err_json = json.loads(detail) if detail else {}
+                    except Exception:
+                        err_json = {}
+                    message = ((err_json.get("error") or {}).get("message") or "").strip()
+                    if message:
+                        raise RuntimeError(
+                            "文字起こしAPIエラー(HTTP 400): "
+                            f"{message} / ファイル形式・録音内容を確認してください（WAVが空/破損の可能性）"
+                        ) from e
+                    raise RuntimeError(
+                        "文字起こしAPIエラー(HTTP 400): リクエスト不正です。"
+                        "ファイル形式・録音内容を確認してください（WAVが空/破損の可能性）"
+                    ) from e
                 if detail:
                     raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code}): {detail}") from e
                 raise RuntimeError(f"文字起こしAPIエラー(HTTP {e.code})") from e
