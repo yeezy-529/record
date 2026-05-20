@@ -836,7 +836,25 @@ class Transcriber:
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_file:
                 temp_path = Path(temp_file.name)
-            cmd = ["ffmpeg", "-y", "-ss", str(start_sec), "-t", str(span), "-i", str(audio_path), "-acodec", "copy", str(temp_path)]
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                str(start_sec),
+                "-t",
+                str(span),
+                "-i",
+                str(audio_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "32k",
+                str(temp_path),
+            ]
             subprocess.run(
                 cmd,
                 check=True,
@@ -1815,11 +1833,14 @@ class App:
             "output_dir": folder,
             "system_wav": folder / "system.wav",
             "mic_wav": folder / "mic.wav",
+            "mixed_wav": folder / "mixed.m4a",
             "txt_out": self.transcript_txt_path(folder),
             "memo_path": folder / "memo.txt",
         }
-        if not job["system_wav"].exists() or not job["mic_wav"].exists():
-            safe_messagebox_error("エラー", "system.wav と mic.wav が見つかりません。")
+        has_mixed = job["mixed_wav"].exists()
+        has_split = job["system_wav"].exists() and job["mic_wav"].exists()
+        if not has_mixed and not has_split:
+            safe_messagebox_error("エラー", "mixed.m4a または system.wav / mic.wav が見つかりません。")
             return
         self.enqueue_transcription_job(job)
 
