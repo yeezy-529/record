@@ -894,6 +894,8 @@ class Transcriber:
         add_field("model", self.model_size)
         add_field("language", LANGUAGE)
         add_field("response_format", "json")
+        if self.model_size == "gpt-4o-transcribe-diarize":
+            add_field("chunking_strategy", "auto")
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
