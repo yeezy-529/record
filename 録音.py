@@ -13,6 +13,7 @@ import ctypes
 import mimetypes
 import uuid
 import urllib.request
+import urllib.error
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -892,7 +893,8 @@ class Transcriber:
 
         add_field("model", self.model_size)
         add_field("language", LANGUAGE)
-        add_field("response_format", "json")
+        if self.model_size != "gpt-4o-transcribe-diarize":
+            add_field("response_format", "json")
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
@@ -919,6 +921,21 @@ class Transcriber:
                 with urllib.request.urlopen(req, timeout=600) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 break
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = (e.read() or b"").decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
+                message = f"HTTP {e.code}: {body}" if body else f"HTTP {e.code}: {e.reason}"
+                if e.code == 400 and "input too large" in body.lower():
+                    raise RuntimeError(message)
+                if e.code == 502 and attempt < 2:
+                    wait_seconds = 2 ** attempt
+                    self.log(f"API一時エラーのため再試行します: {attempt + 1}/3 ({wait_seconds}秒待機)")
+                    threading.Event().wait(wait_seconds)
+                    continue
+                raise RuntimeError(message)
             except Exception as e:
                 last_error = e
                 if "502" not in str(e) or attempt == 2:
