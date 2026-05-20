@@ -13,6 +13,7 @@ import ctypes
 import mimetypes
 import uuid
 import urllib.request
+import tempfile
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -1141,6 +1142,13 @@ class App:
         ).pack(side="left")
         ttk.Button(
             queue_btn_frame,
+            text="▶  動画追加",
+            style="Small.Primary.TButton",
+            command=self.add_video_queue_from_dialog,
+            width=13,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            queue_btn_frame,
             text="♲  選択削除",
             style="Small.TButton",
             command=self.remove_selected_queue,
@@ -1577,18 +1585,33 @@ class App:
         try:
             job_name = Path(result["output_dir"]).name
             self.root.after(0, lambda name=job_name: self.set_transcription_status(name))
-            result["txt_out"] = self.transcript_txt_path(result["output_dir"], self.app_settings)
-            system_rows = self.transcriber.transcribe_file(
-                result["system_wav"],
-                "相手"
-            )
+            if result.get("video_path"):
+                self.add_log(f"動画から音声抽出: {result['video_path']}")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as tmp_audio:
+                    temp_audio_path = Path(tmp_audio.name)
+                try:
+                    cmd = [
+                        "ffmpeg", "-y", "-i", str(result["video_path"]), "-vn", "-ac", "1", "-ar", "16000", str(temp_audio_path)
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    all_rows = self.transcriber.transcribe_file(temp_audio_path, "動画")
+                finally:
+                    if temp_audio_path.exists():
+                        temp_audio_path.unlink()
+                        self.add_log(f"一時音声ファイル削除: {temp_audio_path}")
+            else:
+                result["txt_out"] = self.transcript_txt_path(result["output_dir"], self.app_settings)
+                system_rows = self.transcriber.transcribe_file(
+                    result["system_wav"],
+                    "相手"
+                )
 
-            mic_rows = self.transcriber.transcribe_file(
-                result["mic_wav"],
-                "自分"
-            )
+                mic_rows = self.transcriber.transcribe_file(
+                    result["mic_wav"],
+                    "自分"
+                )
 
-            all_rows = system_rows + mic_rows
+                all_rows = system_rows + mic_rows
             memo_path = result.get("memo_path")
             memo_text = ""
             if memo_path and Path(memo_path).exists():
@@ -1632,7 +1655,8 @@ class App:
     def refresh_queue_listbox(self):
         self.queue_listbox.delete(0, "end")
         for idx, item in enumerate(self.transcription_queue, start=1):
-            self.queue_listbox.insert("end", f"{idx}. {item['output_dir']}")
+            label = item.get("video_path") or item.get("output_dir")
+            self.queue_listbox.insert("end", f"{idx}. {label}")
         if hasattr(self, "queue_count_label"):
             self.queue_count_label.config(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
 
@@ -1656,6 +1680,25 @@ class App:
         if not job["system_wav"].exists() or not job["mic_wav"].exists():
             safe_messagebox_error("エラー", "system.wav と mic.wav が見つかりません。")
             return
+        self.enqueue_transcription_job(job)
+
+    def add_video_queue_from_dialog(self):
+        video_path = filedialog.askopenfilename(
+            title="文字起こし対象動画を選択",
+            filetypes=[
+                ("動画ファイル", "*.mp4 *.mov *.mkv *.avi *.m4v *.wmv *.flv *.webm"),
+                ("すべてのファイル", "*.*"),
+            ],
+        )
+        if not video_path:
+            return
+        video_path = Path(video_path)
+        job = {
+            "output_dir": video_path.parent,
+            "video_path": video_path,
+            "txt_out": video_path.with_suffix('.txt'),
+            "memo_path": None,
+        }
         self.enqueue_transcription_job(job)
 
     def remove_selected_queue(self):
