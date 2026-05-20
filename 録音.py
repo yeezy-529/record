@@ -13,6 +13,7 @@ import ctypes
 import mimetypes
 import uuid
 import urllib.request
+import urllib.error
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -48,6 +49,7 @@ MODEL_CHOICES = {
     "large-v3-turbo": "large-v3-turbo（高速）",
     "gpt-4o-mini-transcribe": "gpt-4o-mini-transcribe（API）",
     "gpt-4o-transcribe": "gpt-4o-transcribe（API・高精度）",
+    "gpt-4o-transcribe-diarize": "gpt-4o-transcribe-diarize（API・話者分離）",
 }
 
 MODEL_FILENAME_CODES = {
@@ -56,6 +58,7 @@ MODEL_FILENAME_CODES = {
     "large-v3-turbo": "la3t",
     "gpt-4o-mini-transcribe": "4ominit",
     "gpt-4o-transcribe": "4ot",
+    "gpt-4o-transcribe-diarize": "4otd",
 }
 
 MODE_CHOICES = {
@@ -72,7 +75,9 @@ DEFAULT_SETTINGS = {
     "openai_api_key": "",
 }
 
-API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
+API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-4o-transcribe-diarize"}
+API_CHUNK_SECONDS = 1000
+API_OVERLAP_SECONDS = 3
 
 
 def ensure_error_log():
@@ -667,7 +672,14 @@ class AudioRecorder:
                 "96k",
                 str(dst_m4a),
             ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             if dst_m4a.exists():
                 try:
                     src_wav.unlink()
@@ -691,13 +703,24 @@ class Transcriber:
         self.compute_type = COMPUTE_TYPE
         self.beam_size = BEAM_SIZE
         self.openai_api_key = ""
+        self.openai_api_key_from_env = False
         self.model_lock = threading.Lock()
+
+    def resolve_api_key(self, user_api_key=""):
+        env_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+        if env_key:
+            self.openai_api_key_from_env = True
+            self.openai_api_key = env_key
+            return env_key
+        self.openai_api_key_from_env = False
+        self.openai_api_key = (user_api_key or "").strip()
+        return self.openai_api_key
 
     def set_settings(self, settings):
         with self.model_lock:
             model_size = settings["model_size"]
             compute_type = settings["compute_type"]
-            self.openai_api_key = (settings.get("openai_api_key", "") or "").strip()
+            self.resolve_api_key(settings.get("openai_api_key", ""))
             if model_size != self.model_size or compute_type != self.compute_type:
                 self.model = None
             self.model_size = model_size
@@ -767,12 +790,97 @@ class Transcriber:
             raise
 
     def _transcribe_file_api(self, audio_path, speaker_label):
-        api_key = (self.openai_api_key or "").strip()
+        api_key = self.resolve_api_key(self.openai_api_key)
         if not api_key:
             raise RuntimeError("APIモデル利用時はOpenAI APIキーを入力してください。")
+        return self._transcribe_api_with_chunking(Path(audio_path), speaker_label)
 
+    def _transcribe_api_with_chunking(self, audio_path, speaker_label):
+        duration = self._probe_duration_seconds(audio_path)
+        if duration <= API_CHUNK_SECONDS:
+            return self._transcribe_api_single(audio_path, speaker_label, offset_sec=0.0)
+
+        rows = []
+        start_sec = 0.0
+        chunk_index = 1
+        while start_sec < duration:
+            end_sec = min(duration, start_sec + API_CHUNK_SECONDS)
+            clip_start = max(0.0, start_sec - API_OVERLAP_SECONDS if chunk_index > 1 else 0.0)
+            clip_end = min(duration, end_sec + API_OVERLAP_SECONDS)
+            chunk_rows = self._transcribe_api_chunk_with_retry(
+                audio_path=audio_path,
+                speaker_label=speaker_label,
+                start_sec=clip_start,
+                end_sec=clip_end,
+                offset_sec=clip_start,
+            )
+            rows.extend(chunk_rows)
+            start_sec = end_sec
+            chunk_index += 1
+
+        return rows
+
+    def _probe_duration_seconds(self, audio_path):
+        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(audio_path)]
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return float((result.stdout or "0").strip() or 0.0)
+
+    def _transcribe_api_chunk_with_retry(self, audio_path, speaker_label, start_sec, end_sec, offset_sec):
+        span = max(0.1, end_sec - start_sec)
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_file:
+                temp_path = Path(temp_file.name)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                str(start_sec),
+                "-t",
+                str(span),
+                "-i",
+                str(audio_path),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "32k",
+                str(temp_path),
+            ]
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            try:
+                return self._transcribe_api_single(temp_path, speaker_label, offset_sec=offset_sec)
+            except Exception as e:
+                message = str(e).lower()
+                if "input too large" in message and span > 250:
+                    mid = start_sec + (span / 2.0)
+                    left = self._transcribe_api_chunk_with_retry(audio_path, speaker_label, start_sec, mid, start_sec)
+                    right = self._transcribe_api_chunk_with_retry(audio_path, speaker_label, mid, end_sec, mid)
+                    return left + right
+                raise
+        finally:
+            if 'temp_path' in locals() and temp_path.exists():
+                temp_path.unlink()
+
+    def _transcribe_api_single(self, audio_path, speaker_label, offset_sec=0.0):
+        api_key = self.resolve_api_key(self.openai_api_key)
         boundary = f"----recordapp{uuid.uuid4().hex}"
-        audio_path = Path(audio_path)
         audio_bytes = audio_path.read_bytes()
         mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
 
@@ -785,7 +893,9 @@ class Transcriber:
 
         add_field("model", self.model_size)
         add_field("language", LANGUAGE)
-        add_field("response_format", "verbose_json")
+        add_field("response_format", "json")
+        if self.model_size == "gpt-4o-transcribe-diarize":
+            add_field("chunking_strategy", "auto")
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
@@ -806,20 +916,58 @@ class Transcriber:
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
             },
         )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        last_error = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=600) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = (e.read() or b"").decode("utf-8", errors="replace")
+                except Exception:
+                    body = ""
+                message = f"HTTP {e.code}: {body}" if body else f"HTTP {e.code}: {e.reason}"
+                if e.code == 400 and "input too large" in body.lower():
+                    raise RuntimeError(message)
+                if e.code == 502 and attempt < 2:
+                    wait_seconds = 2 ** attempt
+                    self.log(f"API一時エラーのため再試行します: {attempt + 1}/3 ({wait_seconds}秒待機)")
+                    threading.Event().wait(wait_seconds)
+                    continue
+                raise RuntimeError(message)
+            except Exception as e:
+                last_error = e
+                if "502" not in str(e) or attempt == 2:
+                    raise
+                wait_seconds = 2 ** attempt
+                self.log(f"API一時エラーのため再試行します: {attempt + 1}/3 ({wait_seconds}秒待機)")
+                threading.Event().wait(wait_seconds)
+        else:
+            raise last_error
 
         rows = []
-        for seg in payload.get("segments", []) or []:
+        segments = payload.get("segments", []) or []
+        for seg in segments:
             text = (seg.get("text", "") or "").strip()
             if not text:
                 continue
             rows.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
+                "start": float(seg.get("start", 0.0)) + offset_sec,
+                "end": float(seg.get("end", 0.0)) + offset_sec,
                 "speaker": speaker_label,
                 "text": text,
             })
+        if not rows:
+            text = (payload.get("text", "") or "").strip()
+            if text:
+                rows.append({
+                    "start": float(offset_sec),
+                    "end": float(offset_sec),
+                    "speaker": speaker_label,
+                    "text": text,
+                })
         return rows
 
     @staticmethod
@@ -1191,6 +1339,15 @@ class App:
         self.api_key_entry = ttk.Entry(settings_frame, textvariable=self.api_key_var, width=30, show="*")
         self.api_key_entry.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
         self.api_key_entry.bind("<FocusOut>", self.on_transcription_setting_changed)
+        self.api_key_note_var = tk.StringVar()
+        self.api_key_note_label = ttk.Label(
+            settings_frame,
+            textvariable=self.api_key_note_var,
+            style="Muted.Card.TLabel",
+            wraplength=340,
+            justify="left",
+        )
+        self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
         ttk.Label(
             settings_frame,
@@ -1198,11 +1355,12 @@ class App:
             style="Muted.Card.TLabel",
             wraplength=340,
             justify="left",
-        ).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(2, 10))
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
         settings_frame.columnconfigure(1, weight=1)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.mode_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
+        self.refresh_api_key_entry_state()
         self.refresh_settings_summary()
 
         self.open_error_btn = ttk.Button(
@@ -1395,7 +1553,17 @@ class App:
             "初回利用時はモデルのダウンロードに時間がかかります。"
         )
 
+    def refresh_api_key_entry_state(self):
+        env_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+        if env_key:
+            self.api_key_entry.configure(state="disabled")
+            self.api_key_note_var.set("OPENAI_API_KEY環境変数が設定されているため、そのキーを使用します。")
+        else:
+            self.api_key_entry.configure(state="normal")
+            self.api_key_note_var.set("OPENAI_API_KEY環境変数が未設定のため、ここにAPIキーを入力してください。")
+
     def on_transcription_setting_changed(self, event=None):
+        self.refresh_api_key_entry_state()
         if self.transcription_running:
             self.model_var.set(MODEL_CHOICES[self.app_settings["model_size"]])
             self.mode_var.set(self.app_settings["mode"])
@@ -1593,7 +1761,14 @@ class App:
                     cmd = [
                         "ffmpeg", "-y", "-i", str(result["video_path"]), "-vn", "-ac", "1", "-ar", "16000", str(temp_audio_path)
                     ]
-                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    subprocess.run(
+                        cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
                     all_rows = self.transcriber.transcribe_file(temp_audio_path, "動画")
                 finally:
                     if temp_audio_path.exists():
@@ -1601,17 +1776,19 @@ class App:
                         self.add_log(f"一時音声ファイル削除: {temp_audio_path}")
             else:
                 result["txt_out"] = self.transcript_txt_path(result["output_dir"], self.app_settings)
-                system_rows = self.transcriber.transcribe_file(
-                    result["system_wav"],
-                    "相手"
-                )
-
-                mic_rows = self.transcriber.transcribe_file(
-                    result["mic_wav"],
-                    "自分"
-                )
-
-                all_rows = system_rows + mic_rows
+                model_size = self.app_settings.get("model_size", DEFAULT_SETTINGS["model_size"])
+                if model_size in API_TRANSCRIBE_MODELS and result.get("mixed_wav"):
+                    all_rows = self.transcriber.transcribe_file(result["mixed_wav"], "MIX")
+                else:
+                    system_rows = self.transcriber.transcribe_file(
+                        result["system_wav"],
+                        "相手"
+                    )
+                    mic_rows = self.transcriber.transcribe_file(
+                        result["mic_wav"],
+                        "自分"
+                    )
+                    all_rows = system_rows + mic_rows
             memo_path = result.get("memo_path")
             memo_text = ""
             if memo_path and Path(memo_path).exists():
@@ -1674,11 +1851,14 @@ class App:
             "output_dir": folder,
             "system_wav": folder / "system.wav",
             "mic_wav": folder / "mic.wav",
+            "mixed_wav": folder / "mixed.m4a",
             "txt_out": self.transcript_txt_path(folder),
             "memo_path": folder / "memo.txt",
         }
-        if not job["system_wav"].exists() or not job["mic_wav"].exists():
-            safe_messagebox_error("エラー", "system.wav と mic.wav が見つかりません。")
+        has_mixed = job["mixed_wav"].exists()
+        has_split = job["system_wav"].exists() and job["mic_wav"].exists()
+        if not has_mixed and not has_split:
+            safe_messagebox_error("エラー", "mixed.m4a または system.wav / mic.wav が見つかりません。")
             return
         self.enqueue_transcription_job(job)
 
@@ -2027,7 +2207,14 @@ class App:
             ["powercfg", "/SETACTIVE", "SCHEME_CURRENT"],
         ]
         for cmd in commands:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
 
     def _get_lid_action_value(self, power_mode):
         result = subprocess.run(
@@ -2035,6 +2222,8 @@ class App:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         matches = re.findall(r"0x[0-9a-fA-F]+|\b\d+\b", result.stdout)
         if not matches:
