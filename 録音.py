@@ -893,8 +893,7 @@ class Transcriber:
 
         add_field("model", self.model_size)
         add_field("language", LANGUAGE)
-        if self.model_size != "gpt-4o-transcribe-diarize":
-            add_field("response_format", "json")
+        add_field("response_format", "json")
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
