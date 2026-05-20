@@ -671,7 +671,14 @@ class AudioRecorder:
                 "96k",
                 str(dst_m4a),
             ]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             if dst_m4a.exists():
                 try:
                     src_wav.unlink()
@@ -814,7 +821,14 @@ class Transcriber:
 
     def _probe_duration_seconds(self, audio_path):
         cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(audio_path)]
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         return float((result.stdout or "0").strip() or 0.0)
 
     def _transcribe_api_chunk_with_retry(self, audio_path, speaker_label, start_sec, end_sec, offset_sec):
@@ -823,7 +837,14 @@ class Transcriber:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_file:
                 temp_path = Path(temp_file.name)
             cmd = ["ffmpeg", "-y", "-ss", str(start_sec), "-t", str(span), "-i", str(audio_path), "-acodec", "copy", str(temp_path)]
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             try:
                 return self._transcribe_api_single(temp_path, speaker_label, offset_sec=offset_sec)
             except Exception as e:
@@ -1704,7 +1725,14 @@ class App:
                     cmd = [
                         "ffmpeg", "-y", "-i", str(result["video_path"]), "-vn", "-ac", "1", "-ar", "16000", str(temp_audio_path)
                     ]
-                    subprocess.run(cmd, check=True, capture_output=True, text=True)
+                    subprocess.run(
+                        cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
                     all_rows = self.transcriber.transcribe_file(temp_audio_path, "動画")
                 finally:
                     if temp_audio_path.exists():
@@ -2140,7 +2168,14 @@ class App:
             ["powercfg", "/SETACTIVE", "SCHEME_CURRENT"],
         ]
         for cmd in commands:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
 
     def _get_lid_action_value(self, power_mode):
         result = subprocess.run(
@@ -2148,6 +2183,8 @@ class App:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         matches = re.findall(r"0x[0-9a-fA-F]+|\b\d+\b", result.stdout)
         if not matches:
