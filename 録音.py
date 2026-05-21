@@ -79,6 +79,43 @@ API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-4o-
 API_CHUNK_SECONDS = 1000
 API_OVERLAP_SECONDS = 3
 
+TRANSCRIPTION_PATTERNS = {
+    "online_one_to_one": "オンラインMTG: 自分 + 相手1人",
+    "online_multi": "オンラインMTG: 自分 + 相手複数",
+    "offline_mic_only": "オフラインMTG: 自分マイクのみ",
+    "test_remote_only": "テスト: 相手音声のみ",
+}
+DEFAULT_TRANSCRIPTION_PATTERN = "online_one_to_one"
+
+PATTERN_ROUTES = {
+    "online_one_to_one": (
+        {"audio_key": "mic_wav", "speaker": "自分", "source": "mic", "model": "large-v3"},
+        {"audio_key": "system_wav", "speaker": "相手", "source": "system", "model": "gpt-4o-transcribe"},
+    ),
+    "online_multi": (
+        {"audio_key": "mic_wav", "speaker": "自分", "source": "mic", "model": "large-v3"},
+        {
+            "audio_key": "system_wav",
+            "speaker": "相手",
+            "source": "system",
+            "model": "gpt-4o-transcribe-diarize",
+            "diarized_prefix": "相手",
+        },
+    ),
+    "offline_mic_only": (
+        {
+            "audio_key": "mic_wav",
+            "speaker": "話者",
+            "source": "mic",
+            "model": "gpt-4o-transcribe-diarize",
+            "diarized_prefix": "話者",
+        },
+    ),
+    "test_remote_only": (
+        {"audio_key": "system_wav", "speaker": "相手", "source": "system", "model": "gpt-4o-transcribe"},
+    ),
+}
+
 
 def ensure_error_log():
     try:
@@ -749,12 +786,20 @@ class Transcriber:
             write_error_log("Transcriber.preload_model error", e)
             raise
 
-    def transcribe_file(self, audio_path, speaker_label):
+    def use_model(self, model_size):
+        with self.model_lock:
+            if model_size != self.model_size:
+                self.model = None
+                self.model_size = model_size
+
+    def transcribe_file(self, audio_path, speaker_label, source="unknown", model_size=None, diarized_prefix=None):
         try:
+            if model_size:
+                self.use_model(model_size)
             self.log(f"文字起こし開始: {speaker_label}")
             rows = []
             if self.model_size in API_TRANSCRIBE_MODELS:
-                rows = self._transcribe_file_api(audio_path, speaker_label)
+                rows = self._transcribe_file_api(audio_path, speaker_label, diarized_prefix=diarized_prefix)
             else:
                 self.preload_model()
                 segments, info = self.model.transcribe(
@@ -779,9 +824,14 @@ class Transcriber:
                         "start": float(seg.start),
                         "end": float(seg.end),
                         "speaker": speaker_label,
+                        "source": source,
+                        "model": self.model_size,
                         "text": text,
                     })
 
+            for row in rows:
+                row.setdefault("source", source)
+                row.setdefault("model", self.model_size)
             self.log(f"文字起こし完了: {speaker_label}")
             return rows
 
@@ -789,16 +839,16 @@ class Transcriber:
             write_error_log(f"Transcriber.transcribe_file error: {speaker_label}", e)
             raise
 
-    def _transcribe_file_api(self, audio_path, speaker_label):
+    def _transcribe_file_api(self, audio_path, speaker_label, diarized_prefix=None):
         api_key = self.resolve_api_key(self.openai_api_key)
         if not api_key:
             raise RuntimeError("APIモデル利用時はOpenAI APIキーを入力してください。")
-        return self._transcribe_api_with_chunking(Path(audio_path), speaker_label)
+        return self._transcribe_api_with_chunking(Path(audio_path), speaker_label, diarized_prefix=diarized_prefix)
 
-    def _transcribe_api_with_chunking(self, audio_path, speaker_label):
+    def _transcribe_api_with_chunking(self, audio_path, speaker_label, diarized_prefix=None):
         duration = self._probe_duration_seconds(audio_path)
         if duration <= API_CHUNK_SECONDS:
-            return self._transcribe_api_single(audio_path, speaker_label, offset_sec=0.0)
+            return self._transcribe_api_single(audio_path, speaker_label, offset_sec=0.0, diarized_prefix=diarized_prefix)
 
         rows = []
         start_sec = 0.0
@@ -813,8 +863,9 @@ class Transcriber:
                 start_sec=clip_start,
                 end_sec=clip_end,
                 offset_sec=clip_start,
+                diarized_prefix=diarized_prefix,
             )
-            rows.extend(chunk_rows)
+            rows = self._merge_api_chunk_rows(rows, chunk_rows)
             start_sec = end_sec
             chunk_index += 1
 
@@ -832,7 +883,7 @@ class Transcriber:
         )
         return float((result.stdout or "0").strip() or 0.0)
 
-    def _transcribe_api_chunk_with_retry(self, audio_path, speaker_label, start_sec, end_sec, offset_sec):
+    def _transcribe_api_chunk_with_retry(self, audio_path, speaker_label, start_sec, end_sec, offset_sec, diarized_prefix=None):
         span = max(0.1, end_sec - start_sec)
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as temp_file:
@@ -865,20 +916,29 @@ class Transcriber:
                 errors="replace",
             )
             try:
-                return self._transcribe_api_single(temp_path, speaker_label, offset_sec=offset_sec)
+                return self._transcribe_api_single(
+                    temp_path,
+                    speaker_label,
+                    offset_sec=offset_sec,
+                    diarized_prefix=diarized_prefix,
+                )
             except Exception as e:
                 message = str(e).lower()
                 if "input too large" in message and span > 250:
                     mid = start_sec + (span / 2.0)
-                    left = self._transcribe_api_chunk_with_retry(audio_path, speaker_label, start_sec, mid, start_sec)
-                    right = self._transcribe_api_chunk_with_retry(audio_path, speaker_label, mid, end_sec, mid)
+                    left = self._transcribe_api_chunk_with_retry(
+                        audio_path, speaker_label, start_sec, mid, start_sec, diarized_prefix=diarized_prefix
+                    )
+                    right = self._transcribe_api_chunk_with_retry(
+                        audio_path, speaker_label, mid, end_sec, mid, diarized_prefix=diarized_prefix
+                    )
                     return left + right
                 raise
         finally:
             if 'temp_path' in locals() and temp_path.exists():
                 temp_path.unlink()
 
-    def _transcribe_api_single(self, audio_path, speaker_label, offset_sec=0.0):
+    def _transcribe_api_single(self, audio_path, speaker_label, offset_sec=0.0, diarized_prefix=None):
         api_key = self.resolve_api_key(self.openai_api_key)
         boundary = f"----recordapp{uuid.uuid4().hex}"
         audio_bytes = audio_path.read_bytes()
@@ -893,9 +953,11 @@ class Transcriber:
 
         add_field("model", self.model_size)
         add_field("language", LANGUAGE)
-        add_field("response_format", "json")
         if self.model_size == "gpt-4o-transcribe-diarize":
+            add_field("response_format", "diarized_json")
             add_field("chunking_strategy", "auto")
+        else:
+            add_field("response_format", "json")
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
@@ -948,18 +1010,27 @@ class Transcriber:
             raise last_error
 
         rows = []
+        diarized_speakers = {}
         segments = payload.get("segments", []) or []
         for seg in segments:
             text = (seg.get("text", "") or "").strip()
             if not text:
                 continue
+            segment_speaker = speaker_label
+            if self.model_size == "gpt-4o-transcribe-diarize":
+                raw_speaker = str(seg.get("speaker", "") or "speaker").strip()
+                if raw_speaker not in diarized_speakers:
+                    diarized_speakers[raw_speaker] = len(diarized_speakers) + 1
+                prefix = diarized_prefix or speaker_label or "話者"
+                segment_speaker = f"{prefix}{diarized_speakers[raw_speaker]}"
             rows.append({
                 "start": float(seg.get("start", 0.0)) + offset_sec,
                 "end": float(seg.get("end", 0.0)) + offset_sec,
-                "speaker": speaker_label,
+                "speaker": segment_speaker,
+                "api_speaker": seg.get("speaker"),
                 "text": text,
             })
-        if not rows:
+        if not rows and self.model_size != "gpt-4o-transcribe-diarize":
             text = (payload.get("text", "") or "").strip()
             if text:
                 rows.append({
@@ -971,6 +1042,30 @@ class Transcriber:
         return rows
 
     @staticmethod
+    def _normalized_text(text):
+        return re.sub(r"\s+", "", (text or "")).strip().lower()
+
+    def _merge_api_chunk_rows(self, existing_rows, chunk_rows):
+        if not existing_rows or not chunk_rows:
+            return existing_rows + chunk_rows
+
+        merged = list(existing_rows)
+        prior_tail = existing_rows[-4:]
+        for row in chunk_rows:
+            normalized = self._normalized_text(row.get("text", ""))
+            duplicate = False
+            if normalized:
+                for old in prior_tail:
+                    same_speaker = old.get("speaker") == row.get("speaker")
+                    near_boundary = abs(float(old.get("start", 0.0)) - float(row.get("start", 0.0))) <= (API_OVERLAP_SECONDS * 2)
+                    duplicate = same_speaker and near_boundary and normalized == self._normalized_text(old.get("text", ""))
+                    if duplicate:
+                        break
+            if not duplicate:
+                merged.append(row)
+        return merged
+
+    @staticmethod
     def fmt(sec):
         sec = max(0, int(sec))
         h = sec // 3600
@@ -978,7 +1073,7 @@ class Transcriber:
         s = sec % 60
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    def export_transcript(self, rows, txt_path, memo_text=""):
+    def export_transcript(self, rows, txt_path, memo_text="", metadata=None):
         try:
             rows = sorted(rows, key=lambda x: x["start"])
 
@@ -996,15 +1091,26 @@ class Transcriber:
                 for r in rows:
                     start = self.fmt(r["start"])
                     end = self.fmt(r["end"])
-                    mark = "🟦 自分" if r["speaker"] == "自分" else "🟧 相手"
+                    mark_icon = "🟦" if r["speaker"] == "自分" else "🟧"
+                    mark = f"{mark_icon} {r['speaker']}"
 
                     f.write(f"[{start} - {end}] {mark}: {r['text']}\n")
 
+            self.export_transcript_json(rows, txt_path, memo_text=memo_text, metadata=metadata)
             self.log(f"文字起こしtxt保存完了: {txt_path}")
 
         except Exception as e:
             write_error_log("Transcriber.export_transcript error", e)
             raise
+
+    def export_transcript_json(self, rows, txt_path, memo_text="", metadata=None):
+        json_path = Path(txt_path).with_suffix(".json")
+        payload = {
+            "memo": (memo_text or "").strip(),
+            "metadata": metadata or {},
+            "segments": rows,
+        }
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # =========================
@@ -1548,8 +1654,9 @@ class App:
         mode = self.mode_var.get() if self.mode_var.get() in MODE_CHOICES else DEFAULT_SETTINGS["mode"]
         beam_size = MODE_CHOICES[mode]
         self.settings_summary_var.set(
-            f"選択中の起動中だけ有効です。次回の文字起こしから反映します。model={model_size}, "
-            f"beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
+            f"録音フォルダはキュー追加時のパターンでモデルを自動選択します。"
+            f"ここで選ぶ model={model_size} は動画文字起こしに使います。"
+            f"large-v3 の beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
             "初回利用時はモデルのダウンロードに時間がかかります。"
         )
 
@@ -1730,8 +1837,11 @@ class App:
             self.last_output_dir = result["output_dir"]
             result["memo_path"] = self.save_recording_memo(result["output_dir"])
 
-            self.enqueue_transcription_job(result)
-            self.add_log("録音停止後に文字起こしキューへ追加しました。文字起こし開始ボタンを押してください。")
+            queued = self.enqueue_transcription_job(result)
+            if queued:
+                self.add_log("録音停止後に文字起こしキューへ追加しました。文字起こし開始ボタンを押してください。")
+            else:
+                self.add_log("録音は保存しました。文字起こしキューには追加していません。")
             self.status_var.set("待機中")
             self.enable_controls()
             self.schedule_preview_level_meter()
@@ -1754,6 +1864,7 @@ class App:
             job_name = Path(result["output_dir"]).name
             self.root.after(0, lambda name=job_name: self.set_transcription_status(name))
             if result.get("video_path"):
+                self.transcriber.set_settings(self.app_settings)
                 self.add_log(f"動画から音声抽出: {result['video_path']}")
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as tmp_audio:
                     temp_audio_path = Path(tmp_audio.name)
@@ -1776,25 +1887,18 @@ class App:
                         self.add_log(f"一時音声ファイル削除: {temp_audio_path}")
             else:
                 result["txt_out"] = self.transcript_txt_path(result["output_dir"], self.app_settings)
-                model_size = self.app_settings.get("model_size", DEFAULT_SETTINGS["model_size"])
-                if model_size in API_TRANSCRIBE_MODELS and result.get("mixed_wav"):
-                    all_rows = self.transcriber.transcribe_file(result["mixed_wav"], "MIX")
-                else:
-                    system_rows = self.transcriber.transcribe_file(
-                        result["system_wav"],
-                        "相手"
-                    )
-                    mic_rows = self.transcriber.transcribe_file(
-                        result["mic_wav"],
-                        "自分"
-                    )
-                    all_rows = system_rows + mic_rows
+                all_rows = self.transcribe_pattern_job(result)
             memo_path = result.get("memo_path")
             memo_text = ""
             if memo_path and Path(memo_path).exists():
                 memo_text = Path(memo_path).read_text(encoding="utf-8")
 
-            self.transcriber.export_transcript(all_rows, result["txt_out"], memo_text=memo_text)
+            metadata = {
+                "transcription_pattern": result.get("transcription_pattern"),
+                "transcription_pattern_label": self.transcription_pattern_label(result.get("transcription_pattern")),
+                "output_dir": str(result.get("output_dir", "")),
+            }
+            self.transcriber.export_transcript(all_rows, result["txt_out"], memo_text=memo_text, metadata=metadata)
             if memo_path and Path(memo_path).exists():
                 Path(memo_path).unlink()
                 self.add_log(f"メモ一時ファイル削除: {memo_path}")
@@ -1824,16 +1928,49 @@ class App:
             )
             return False
 
+    def transcribe_pattern_job(self, result):
+        pattern = result.get("transcription_pattern") or DEFAULT_TRANSCRIPTION_PATTERN
+        routes = PATTERN_ROUTES.get(pattern)
+        if not routes:
+            raise RuntimeError(f"未対応の文字起こしパターンです: {pattern}")
+
+        all_rows = []
+        self.add_log(f"文字起こしパターン: {self.transcription_pattern_label(pattern)}")
+        for route in routes:
+            audio_path = Path(result[route["audio_key"]])
+            if not audio_path.exists():
+                raise RuntimeError(f"文字起こし対象音声が見つかりません: {audio_path}")
+            route_rows = self.transcriber.transcribe_file(
+                audio_path,
+                route["speaker"],
+                source=route["source"],
+                model_size=route["model"],
+                diarized_prefix=route.get("diarized_prefix"),
+            )
+            all_rows.extend(route_rows)
+        return all_rows
+
     def enqueue_transcription_job(self, result):
+        if not result.get("video_path") and not result.get("transcription_pattern"):
+            pattern = self.ask_transcription_pattern()
+            if not pattern:
+                self.add_log(f"文字起こしキュー追加を中止: {result.get('output_dir')}")
+                return False
+            result["transcription_pattern"] = pattern
         self.transcription_queue.append(result)
         self.refresh_queue_listbox()
-        self.add_log(f"文字起こしキュー追加: {result['output_dir']}")
+        pattern_label = self.transcription_pattern_label(result.get("transcription_pattern"))
+        suffix = f" ({pattern_label})" if pattern_label else ""
+        self.add_log(f"文字起こしキュー追加: {result['output_dir']}{suffix}")
+        return True
 
     def refresh_queue_listbox(self):
         self.queue_listbox.delete(0, "end")
         for idx, item in enumerate(self.transcription_queue, start=1):
             label = item.get("video_path") or item.get("output_dir")
-            self.queue_listbox.insert("end", f"{idx}. {label}")
+            pattern_label = self.transcription_pattern_label(item.get("transcription_pattern"))
+            suffix = f" / {pattern_label}" if pattern_label else ""
+            self.queue_listbox.insert("end", f"{idx}. {label}{suffix}")
         if hasattr(self, "queue_count_label"):
             self.queue_count_label.config(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
 
@@ -1856,11 +1993,56 @@ class App:
             "memo_path": folder / "memo.txt",
         }
         has_mixed = job["mixed_wav"].exists()
-        has_split = job["system_wav"].exists() and job["mic_wav"].exists()
-        if not has_mixed and not has_split:
-            safe_messagebox_error("エラー", "mixed.m4a または system.wav / mic.wav が見つかりません。")
+        has_split_audio = job["system_wav"].exists() or job["mic_wav"].exists()
+        if not has_mixed and not has_split_audio:
+            safe_messagebox_error("エラー", "mixed.m4a、system.wav、mic.wav のいずれも見つかりません。")
             return
         self.enqueue_transcription_job(job)
+
+    def transcription_pattern_label(self, pattern):
+        return TRANSCRIPTION_PATTERNS.get(pattern, "")
+
+    def ask_transcription_pattern(self):
+        selected_pattern = {"value": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("文字起こしパターン")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="この録音の文字起こしパターンを選択してください。").pack(anchor="w", pady=(0, 10))
+
+        label_to_pattern = {label: pattern for pattern, label in TRANSCRIPTION_PATTERNS.items()}
+        pattern_var = tk.StringVar(value=TRANSCRIPTION_PATTERNS[DEFAULT_TRANSCRIPTION_PATTERN])
+        pattern_combo = ttk.Combobox(
+            frame,
+            textvariable=pattern_var,
+            values=list(label_to_pattern.keys()),
+            state="readonly",
+            width=38,
+        )
+        pattern_combo.pack(fill="x", pady=(0, 12))
+        pattern_combo.focus_set()
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(fill="x")
+
+        def accept():
+            selected_pattern["value"] = label_to_pattern.get(pattern_var.get())
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="追加", style="Small.Primary.TButton", command=accept).pack(side="left")
+        ttk.Button(button_frame, text="キャンセル", style="Small.TButton", command=cancel).pack(side="left", padx=(8, 0))
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Return>", lambda _event: accept())
+        dialog.bind("<Escape>", lambda _event: cancel())
+        self.root.wait_window(dialog)
+        return selected_pattern["value"]
 
     def add_video_queue_from_dialog(self):
         video_path = filedialog.askopenfilename(
