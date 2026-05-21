@@ -28,6 +28,8 @@ from faster_whisper import WhisperModel
 # 設定
 # =========================
 APP_TITLE = "レコードApp"
+# PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
+APP_VERSION = "1.00"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1336,24 +1338,7 @@ class App:
             command=self.start_recording,
             state="disabled"
         )
-        self.start_btn.pack(side="left", padx=(0, 10))
-
-        self.stop_btn = ttk.Button(
-            btn_frame,
-            text="◉  録音停止",
-            command=self.stop_recording,
-            state="disabled"
-        )
-        self.stop_btn.pack(side="left", padx=(0, 10))
-
-        self.open_folder_btn = ttk.Button(
-            btn_frame,
-            text="□  録音フォルダを開く",
-            style="Accent.TButton",
-            command=self.open_output_folder,
-            state="normal"
-        )
-        self.open_folder_btn.pack(side="left", padx=(0, 10))
+        self.start_btn.pack(fill="x")
 
         self.build_recording_view()
 
@@ -1367,6 +1352,14 @@ class App:
             state="normal"
         )
         self.start_transcribe_btn.pack(side="left")
+        self.open_folder_btn = ttk.Button(
+            analysis_top_frame,
+            text="□  録音フォルダを開く",
+            style="Small.TButton",
+            command=self.open_output_folder,
+            state="normal",
+        )
+        self.open_folder_btn.pack(side="left", padx=(10, 0))
 
         ttk.Label(analysis_tab, text="文字起こしキュー", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
         self.queue_count_label = ttk.Label(analysis_tab, text="追加済みファイル（0 件）", font=("Yu Gothic UI", 10, "bold"))
@@ -1413,6 +1406,11 @@ class App:
 
         settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         settings_top_frame.pack(fill="x")
+        ttk.Label(
+            settings_top_frame,
+            text=f"v{APP_VERSION}",
+            style="TLabel",
+        ).pack(side="right")
 
         settings_card, settings_frame = self._card(settings_tab, padx=12, pady=12)
         settings_card.pack(fill="x", pady=(0, 12))
@@ -1793,7 +1791,6 @@ class App:
             ).start()
 
             self.start_btn.config(state="disabled")
-            self.stop_btn.config(state="normal")
             self.recording_stop_btn.config(state="normal")
             self.reload_btn.config(state="disabled")
             self.system_combo.config(state="disabled")
@@ -1815,7 +1812,6 @@ class App:
     def stop_recording(self):
         try:
             self.status_var.set("録音停止処理中")
-            self.stop_btn.config(state="disabled")
             self.recording_stop_btn.config(state="disabled")
 
             if self.timer_job:
@@ -2181,7 +2177,6 @@ class App:
 
     def enable_controls(self):
         self.start_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
         self.recording_stop_btn.config(state="normal")
         self.reload_btn.config(state="normal")
         self.system_combo.config(state="readonly")
