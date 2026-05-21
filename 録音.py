@@ -15,6 +15,7 @@ import uuid
 import urllib.request
 import urllib.error
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
@@ -88,6 +89,7 @@ TRANSCRIPTION_PATTERNS = {
     "manual": "マニュアル: 文字起こし設定を使う",
 }
 DEFAULT_TRANSCRIPTION_PATTERN = "online_one_to_one"
+PARALLEL_TRANSCRIPTION_PATTERNS = {"online_one_to_one", "online_multi"}
 
 PATTERN_ROUTES = {
     "online_one_to_one": (
@@ -1941,7 +1943,6 @@ class App:
         if not routes:
             raise RuntimeError(f"未対応の文字起こしパターンです: {pattern}")
 
-        all_rows = []
         self.add_log(f"文字起こしパターン: {self.transcription_pattern_label(pattern)}")
         if any(route["model"] in API_TRANSCRIBE_MODELS for route in routes):
             api_key = self.transcriber.resolve_api_key(self.transcriber.openai_api_key)
@@ -1950,22 +1951,54 @@ class App:
                     "この文字起こしパターンはOpenAI APIを使います。"
                     "OpenAI APIキーを設定してから再実行してください。"
                 )
+        if pattern in PARALLEL_TRANSCRIPTION_PATTERNS:
+            return self.transcribe_pattern_routes_parallel(result, routes)
+
+        all_rows = []
         for route in routes:
-            audio_path = Path(result[route["audio_key"]])
-            if not audio_path.exists():
-                raise RuntimeError(f"文字起こし対象音声が見つかりません: {audio_path}")
-            self.add_log(
-                f"文字起こし経路: {route['source']} / model={route['model']} / speaker={route['speaker']}"
-            )
-            route_rows = self.transcriber.transcribe_file(
-                audio_path,
-                route["speaker"],
-                source=route["source"],
-                model_size=route["model"],
-                diarized_prefix=route.get("diarized_prefix"),
-            )
-            all_rows.extend(route_rows)
+            all_rows.extend(self.transcribe_pattern_route(result, route))
         return all_rows
+
+    def transcribe_pattern_routes_parallel(self, result, routes):
+        route_transcribers = [
+            self.new_api_route_transcriber(route["model"])
+            if route["model"] in API_TRANSCRIBE_MODELS
+            else self.transcriber
+            for route in routes
+        ]
+
+        all_rows = []
+        with ThreadPoolExecutor(max_workers=len(routes)) as executor:
+            futures = [
+                executor.submit(self.transcribe_pattern_route, result, route, transcriber)
+                for route, transcriber in zip(routes, route_transcribers)
+            ]
+            for future in futures:
+                all_rows.extend(future.result())
+        return all_rows
+
+    def new_api_route_transcriber(self, model_size):
+        route_settings = self.app_settings.copy()
+        route_settings["model_size"] = model_size
+        transcriber = Transcriber(self.add_log)
+        transcriber.set_settings(route_settings)
+        return transcriber
+
+    def transcribe_pattern_route(self, result, route, transcriber=None):
+        audio_path = Path(result[route["audio_key"]])
+        if not audio_path.exists():
+            raise RuntimeError(f"文字起こし対象音声が見つかりません: {audio_path}")
+        self.add_log(
+            f"文字起こし経路: {route['source']} / model={route['model']} / speaker={route['speaker']}"
+        )
+        transcriber = transcriber or self.transcriber
+        return transcriber.transcribe_file(
+            audio_path,
+            route["speaker"],
+            source=route["source"],
+            model_size=route["model"],
+            diarized_prefix=route.get("diarized_prefix"),
+        )
 
     def transcribe_manual_job(self, result):
         model_size = self.app_settings.get("model_size", DEFAULT_SETTINGS["model_size"])
