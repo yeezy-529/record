@@ -78,12 +78,14 @@ DEFAULT_SETTINGS = {
 API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-4o-transcribe-diarize"}
 API_CHUNK_SECONDS = 1000
 API_OVERLAP_SECONDS = 3
+API_KEY_MASK = "******************"
 
 TRANSCRIPTION_PATTERNS = {
     "online_one_to_one": "オンラインMTG: 自分 + 相手1人",
     "online_multi": "オンラインMTG: 自分 + 相手複数",
     "offline_mic_only": "オフラインMTG: 自分マイクのみ",
     "test_remote_only": "テスト: 相手音声のみ",
+    "manual": "マニュアル: 文字起こし設定を使う",
 }
 DEFAULT_TRANSCRIPTION_PATTERN = "online_one_to_one"
 
@@ -1655,7 +1657,7 @@ class App:
         beam_size = MODE_CHOICES[mode]
         self.settings_summary_var.set(
             f"録音フォルダはキュー追加時のパターンでモデルを自動選択します。"
-            f"ここで選ぶ model={model_size} は動画文字起こしに使います。"
+            f"マニュアルパターンと動画文字起こしはここで選ぶ model={model_size} を使います。"
             f"large-v3 の beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
             "初回利用時はモデルのダウンロードに時間がかかります。"
         )
@@ -1663,9 +1665,12 @@ class App:
     def refresh_api_key_entry_state(self):
         env_key = (os.getenv("OPENAI_API_KEY", "") or "").strip()
         if env_key:
+            self.api_key_var.set(API_KEY_MASK)
             self.api_key_entry.configure(state="disabled")
             self.api_key_note_var.set("OPENAI_API_KEY環境変数が設定されているため、そのキーを使用します。")
         else:
+            if self.api_key_var.get() == API_KEY_MASK:
+                self.api_key_var.set("")
             self.api_key_entry.configure(state="normal")
             self.api_key_note_var.set("OPENAI_API_KEY環境変数が未設定のため、ここにAPIキーを入力してください。")
 
@@ -1685,7 +1690,7 @@ class App:
             "mode": mode,
             "beam_size": MODE_CHOICES[mode],
             "compute_type": COMPUTE_TYPE,
-            "openai_api_key": self.api_key_var.get().strip(),
+            "openai_api_key": "" if self.api_key_var.get() == API_KEY_MASK else self.api_key_var.get().strip(),
         }
 
         self.app_settings = settings
@@ -1930,16 +1935,28 @@ class App:
 
     def transcribe_pattern_job(self, result):
         pattern = result.get("transcription_pattern") or DEFAULT_TRANSCRIPTION_PATTERN
+        if pattern == "manual":
+            return self.transcribe_manual_job(result)
         routes = PATTERN_ROUTES.get(pattern)
         if not routes:
             raise RuntimeError(f"未対応の文字起こしパターンです: {pattern}")
 
         all_rows = []
         self.add_log(f"文字起こしパターン: {self.transcription_pattern_label(pattern)}")
+        if any(route["model"] in API_TRANSCRIBE_MODELS for route in routes):
+            api_key = self.transcriber.resolve_api_key(self.transcriber.openai_api_key)
+            if not api_key:
+                raise RuntimeError(
+                    "この文字起こしパターンはOpenAI APIを使います。"
+                    "OpenAI APIキーを設定してから再実行してください。"
+                )
         for route in routes:
             audio_path = Path(result[route["audio_key"]])
             if not audio_path.exists():
                 raise RuntimeError(f"文字起こし対象音声が見つかりません: {audio_path}")
+            self.add_log(
+                f"文字起こし経路: {route['source']} / model={route['model']} / speaker={route['speaker']}"
+            )
             route_rows = self.transcriber.transcribe_file(
                 audio_path,
                 route["speaker"],
@@ -1948,6 +1965,36 @@ class App:
                 diarized_prefix=route.get("diarized_prefix"),
             )
             all_rows.extend(route_rows)
+        return all_rows
+
+    def transcribe_manual_job(self, result):
+        model_size = self.app_settings.get("model_size", DEFAULT_SETTINGS["model_size"])
+        self.transcriber.set_settings(self.app_settings)
+        self.add_log(f"文字起こしパターン: {self.transcription_pattern_label('manual')}")
+        self.add_log(f"マニュアル文字起こしモデル: {model_size}")
+
+        if model_size in API_TRANSCRIBE_MODELS:
+            api_key = self.transcriber.resolve_api_key(self.transcriber.openai_api_key)
+            if not api_key:
+                raise RuntimeError(
+                    "マニュアル文字起こしで選択したモデルはOpenAI APIを使います。"
+                    "OpenAI APIキーを設定してから再実行してください。"
+                )
+            mixed_path = Path(result["mixed_wav"])
+            if mixed_path.exists():
+                self.add_log(f"文字起こし経路: mixed / model={model_size} / speaker=MIX")
+                return self.transcriber.transcribe_file(mixed_path, "MIX", source="mixed")
+
+        all_rows = []
+        for audio_key, speaker, source in (
+            ("system_wav", "相手", "system"),
+            ("mic_wav", "自分", "mic"),
+        ):
+            audio_path = Path(result[audio_key])
+            if not audio_path.exists():
+                raise RuntimeError(f"マニュアル文字起こし対象音声が見つかりません: {audio_path}")
+            self.add_log(f"文字起こし経路: {source} / model={model_size} / speaker={speaker}")
+            all_rows.extend(self.transcriber.transcribe_file(audio_path, speaker, source=source))
         return all_rows
 
     def enqueue_transcription_job(self, result):
