@@ -30,7 +30,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.02"
+APP_VERSION = "1.03"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
