@@ -30,7 +30,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.01"
+APP_VERSION = "1.02"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1445,11 +1445,19 @@ class App:
 
         settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         settings_top_frame.pack(fill="x")
+        settings_version_frame = ttk.Frame(settings_top_frame, style="Tab.TFrame")
+        settings_version_frame.pack(side="right", anchor="n")
         ttk.Label(
-            settings_top_frame,
+            settings_version_frame,
             text=f"v{APP_VERSION}",
             style="TLabel",
-        ).pack(side="right")
+        ).pack(anchor="e")
+        ttk.Button(
+            settings_version_frame,
+            text="アプリ説明",
+            style="Small.TButton",
+            command=self.show_app_description,
+        ).pack(anchor="e", pady=(4, 0))
 
         settings_card, settings_frame = self._card(settings_tab, padx=12, pady=12)
         settings_card.pack(fill="x", pady=(0, 12))
@@ -1493,14 +1501,6 @@ class App:
             justify="left",
         )
         self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
-        ttk.Label(
-            settings_frame,
-            textvariable=self.settings_summary_var,
-            style="Muted.Card.TLabel",
-            wraplength=340,
-            justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
         settings_frame.columnconfigure(1, weight=1)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
@@ -1705,6 +1705,16 @@ class App:
             f"マニュアルパターンと動画文字起こしはここで選ぶ model={model_size} を使います。"
             f"large-v3 の beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
             "初回利用時はモデルのダウンロードに時間がかかります。"
+        )
+
+    def show_app_description(self):
+        self.refresh_settings_summary()
+        safe_messagebox_info(
+            "アプリ説明",
+            "録音した音声や追加した動画を文字起こしするアプリです。\n\n"
+            f"{self.settings_summary_var.get()}\n\n"
+            "OpenAI APIモデルを使う場合は OpenAI APIキーが必要です。"
+            "OPENAI_API_KEY 環境変数が設定されている場合は、そのキーを優先して使います。",
         )
 
     def refresh_api_key_entry_state(self):
