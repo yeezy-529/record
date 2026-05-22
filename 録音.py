@@ -30,7 +30,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.01"
+APP_VERSION = "1.02"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,7 +87,6 @@ TRANSCRIPTION_PATTERNS = {
     "online_one_to_one": "オンラインMTG: 自分 + 相手1人",
     "online_multi": "オンラインMTG: 自分 + 相手複数",
     "offline_mic_only": "オフラインMTG: 自分マイクのみ",
-    "test_remote_only": "テスト: 相手音声のみ",
     "manual": "マニュアル: 文字起こし設定を使う",
 }
 DEFAULT_TRANSCRIPTION_PATTERN = "online_one_to_one"
@@ -116,9 +115,6 @@ PATTERN_ROUTES = {
             "model": "gpt-4o-transcribe-diarize",
             "diarized_prefix": "話者",
         },
-    ),
-    "test_remote_only": (
-        {"audio_key": "system_wav", "speaker": "相手", "source": "system", "model": "gpt-4o-transcribe"},
     ),
 }
 
@@ -1445,11 +1441,19 @@ class App:
 
         settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
         settings_top_frame.pack(fill="x")
+        settings_version_frame = ttk.Frame(settings_top_frame, style="Tab.TFrame")
+        settings_version_frame.pack(side="right", anchor="n")
         ttk.Label(
-            settings_top_frame,
+            settings_version_frame,
             text=f"v{APP_VERSION}",
             style="TLabel",
-        ).pack(side="right")
+        ).pack(anchor="e")
+        ttk.Button(
+            settings_version_frame,
+            text="アプリ説明",
+            style="Small.TButton",
+            command=self.show_app_description,
+        ).pack(anchor="e", pady=(4, 0))
 
         settings_card, settings_frame = self._card(settings_tab, padx=12, pady=12)
         settings_card.pack(fill="x", pady=(0, 12))
@@ -1493,14 +1497,6 @@ class App:
             justify="left",
         )
         self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
-        ttk.Label(
-            settings_frame,
-            textvariable=self.settings_summary_var,
-            style="Muted.Card.TLabel",
-            wraplength=340,
-            justify="left",
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 10))
 
         settings_frame.columnconfigure(1, weight=1)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
@@ -1705,6 +1701,75 @@ class App:
             f"マニュアルパターンと動画文字起こしはここで選ぶ model={model_size} を使います。"
             f"large-v3 の beam_size={beam_size}, compute_type={COMPUTE_TYPE}。"
             "初回利用時はモデルのダウンロードに時間がかかります。"
+        )
+
+    def show_app_description(self):
+        safe_messagebox_info(
+            "アプリ説明",
+            "【ホーム画面】\n"
+            "録音に使う相手音声デバイスとマイクを選択し、録音を開始する画面です。\n"
+            "録音中は相手音声とマイクの音量レベルを確認できます。\n\n"
+            "録音中にメモを入力できます。\n"
+            "入力したメモは、文字起こし完了後に出力されるテキストファイルへ追加されます。\n"
+            "会議中の補足、確認したい点、文字起こしだけでは残しにくい情報を記録したい場合に使えます。\n\n"
+            "録音を停止すると録音データが保存され、文字起こしキューへ追加できます。\n\n\n"
+            "【分析画面】\n"
+            "録音フォルダや動画を文字起こしキューに追加し、文字起こしを実行する画面です。\n"
+            "追加した対象は一覧で確認でき、不要な項目は選択して削除できます。\n"
+            "録音フォルダを開いて、保存済みの音声や文字起こし結果を確認することもできます。\n\n"
+            "動画ファイルも追加できます。\n"
+            "動画追加では、動画から音声を取り出して文字起こしを行います。\n\n"
+            "フォルダ追加では、録音内容に合う文字起こしパターンを選びます。\n\n"
+            "・オンラインMTG: 自分 + 相手1人\n"
+            "  自分のマイク音声と相手音声を分けて文字起こしします。\n"
+            "  1対1のオンライン会議向けです。\n"
+            "  使用モデル\n"
+            "    自分: large-v3\n"
+            "    相手: gpt-4o-transcribe\n\n"
+            "・オンラインMTG: 自分 + 相手複数\n"
+            "  自分のマイク音声と相手側の音声を使って文字起こしします。\n"
+            "  相手側は複数人の発話を想定した話者分離を使います。\n"
+            "  使用モデル\n"
+            "    自分: large-v3\n"
+            "    相手: gpt-4o-transcribe-diarize\n\n"
+            "・オフラインMTG: 自分マイクのみ\n"
+            "  マイクで録音した音声だけを使って文字起こしします。\n"
+            "  対面会議など、1本のマイク音声に複数人の声が入る場合向けです。\n"
+            "  使用モデル\n"
+            "    マイク音声: gpt-4o-transcribe-diarize\n\n"
+            "・マニュアル\n"
+            "  設定画面で選択したモデルを使って文字起こしします。\n\n"
+            "上記パターンでは、OpenAI APIモデルを使う経路があります。\n"
+            "APIモデルを使う場合は、設定画面でOpenAI APIキーを設定してください。\n\n\n"
+            "【設定画面】\n"
+            "文字起こしに使うモデル、処理モード、OpenAI APIキーを設定する画面です。\n\n"
+            "モデルは、文字起こしに使う方式を選びます。\n"
+            "ローカルモデルはPC上で処理します。\n"
+            "精度を重視する場合は large-v3 がおすすめです。\n"
+            "ただし会社PCはスペックが低いため、large-v3 では録音時間と同程度の処理時間がかかる場合があります。\n\n"
+            "・medium\n"
+            "  標準的で比較的軽いローカルモデルです。\n\n"
+            "・large-v3\n"
+            "  精度重視のローカルモデルです。\n\n"
+            "・large-v3-turbo\n"
+            "  large-v3 より速度を重視したローカルモデルです。\n\n"
+            "・gpt-4o-mini-transcribe\n"
+            "  OpenAI APIを使う文字起こしモデルです。\n\n"
+            "・gpt-4o-transcribe\n"
+            "  OpenAI APIを使う高精度な文字起こしモデルです。\n\n"
+            "・gpt-4o-transcribe-diarize\n"
+            "  OpenAI APIを使い、話者分離を行う文字起こしモデルです。\n\n"
+            "処理モードは、ローカル文字起こしの速度と精度のバランスを選びます。\n\n"
+            "・高速\n"
+            "  処理速度を優先します。\n\n"
+            "・標準\n"
+            "  速度と精度のバランスを取ります。\n\n"
+            "・高精度\n"
+            "  精度を優先しますが、処理時間は長くなります。\n\n"
+            "録音フォルダの文字起こしでは、追加時に選んだパターンに応じてモデルが自動選択されます。\n"
+            "マニュアルパターンや動画文字起こしでは、ここで選んだモデル設定を使います。\n\n"
+            "OpenAI APIモデルを使う場合はAPIキーが必要です。\n"
+            "OPENAI_API_KEY 環境変数が設定されている場合は、そのキーを優先して使います。",
         )
 
     def refresh_api_key_entry_state(self):
