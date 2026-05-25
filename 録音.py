@@ -36,6 +36,7 @@ BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 ERROR_LOG = BASE_DIR / "error_log.txt"
+TRANSCRIPTION_PROMPT_FILE = BASE_DIR / "transcription_prompt.txt"
 
 FORMAT = pyaudio.paInt16
 CHUNK = 2048
@@ -1504,34 +1505,22 @@ class App:
         )
         self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
-        ttk.Label(settings_frame, text="文字起こしプロンプト", style="Card.TLabel").grid(
-            row=5,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(4, 4),
-        )
-        self.prompt_text = tk.Text(
-            settings_frame,
-            height=4,
-            wrap="word",
-            relief="flat",
-            borderwidth=0,
-            bg=self.card_color,
-            fg=self.text_color,
-            insertbackground=self.accent_color,
-            font=("Yu Gothic UI", 9),
-        )
-        self.prompt_text.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        self.prompt_text.insert("1.0", self.app_settings["transcription_prompt"])
-        self.prompt_text.bind("<FocusOut>", self.on_transcription_setting_changed)
+        prompt_frame = ttk.Frame(settings_frame, style="Card.TFrame")
+        prompt_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(4, 6))
+        ttk.Label(prompt_frame, text="文字起こしプロンプト", style="Card.TLabel").pack(side="left")
+        ttk.Button(
+            prompt_frame,
+            text="メモを開く",
+            style="Small.TButton",
+            command=self.open_transcription_prompt_file,
+        ).pack(side="right")
         ttk.Label(
             settings_frame,
-            text="固有名詞、専門用語、略語などを入力すると文字起こし時の参考情報として使います。",
+            text=f"{TRANSCRIPTION_PROMPT_FILE.name} に固有名詞、専門用語、略語などを書き溜めると文字起こし時の参考情報として使います。",
             style="Muted.Card.TLabel",
             wraplength=340,
             justify="left",
-        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
         settings_frame.columnconfigure(1, weight=1)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
@@ -1802,8 +1791,8 @@ class App:
             "  速度と精度のバランスを取ります。\n\n"
             "・高精度\n"
             "  精度を優先しますが、処理時間は長くなります。\n\n"
-            "文字起こしプロンプトには、固有名詞、専門用語、略語などを入力できます。\n"
-            "入力した内容は、ローカルモデルと対応しているOpenAI APIモデルの文字起こし時に参考情報として使われます。\n\n"
+            f"文字起こしプロンプトは {TRANSCRIPTION_PROMPT_FILE.name} に書き溜めます。\n"
+            "固有名詞、専門用語、略語などを書いておくと、ローカルモデルと対応しているOpenAI APIモデルの文字起こし時に参考情報として使われます。\n\n"
             "録音フォルダの文字起こしでは、追加時に選んだパターンに応じてモデルが自動選択されます。\n"
             "マニュアルパターンや動画文字起こしでは、ここで選んだモデル設定を使います。\n\n"
             "OpenAI APIモデルを使う場合はAPIキーが必要です。\n"
@@ -1822,16 +1811,35 @@ class App:
             self.api_key_entry.configure(state="normal")
             self.api_key_note_var.set("OPENAI_API_KEY環境変数が未設定のため、ここにAPIキーを入力してください。")
 
-    def get_transcription_prompt_text(self):
-        if not hasattr(self, "prompt_text"):
+    def read_transcription_prompt_file(self):
+        try:
+            if not TRANSCRIPTION_PROMPT_FILE.exists():
+                return ""
+            return TRANSCRIPTION_PROMPT_FILE.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            write_error_log("App.read_transcription_prompt_file error", e)
+            self.add_log(f"文字起こしプロンプトを読み込めませんでした: {e}")
             return ""
-        return self.prompt_text.get("1.0", "end").strip()
 
-    def set_transcription_prompt_text(self, value):
-        if not hasattr(self, "prompt_text"):
-            return
-        self.prompt_text.delete("1.0", "end")
-        self.prompt_text.insert("1.0", value or "")
+    def refresh_transcription_prompt_setting(self):
+        prompt = self.read_transcription_prompt_file()
+        self.app_settings["transcription_prompt"] = prompt
+        self.transcriber.set_settings(self.app_settings)
+        return prompt
+
+    def open_transcription_prompt_file(self):
+        try:
+            TRANSCRIPTION_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if not TRANSCRIPTION_PROMPT_FILE.exists():
+                TRANSCRIPTION_PROMPT_FILE.write_text(
+                    "固有名詞、専門用語、略語などをここに書き溜めてください。\n"
+                    "例: Florbital, レコードApp, gpt-4o-transcribe\n",
+                    encoding="utf-8",
+                )
+            os.startfile(str(TRANSCRIPTION_PROMPT_FILE.resolve()))
+        except Exception as e:
+            write_error_log("App.open_transcription_prompt_file error", e)
+            safe_messagebox_error("エラー", f"プロンプトメモを開けませんでした。\n\n{e}")
 
     def on_transcription_setting_changed(self, event=None):
         self.refresh_api_key_entry_state()
@@ -1839,7 +1847,6 @@ class App:
             self.model_var.set(MODEL_CHOICES[self.app_settings["model_size"]])
             self.mode_var.set(self.app_settings["mode"])
             self.api_key_var.set(self.app_settings.get("openai_api_key", ""))
-            self.set_transcription_prompt_text(self.app_settings.get("transcription_prompt", ""))
             self.refresh_settings_summary()
             safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に変更してください。")
             return
@@ -1851,7 +1858,7 @@ class App:
             "beam_size": MODE_CHOICES[mode],
             "compute_type": COMPUTE_TYPE,
             "openai_api_key": "" if self.api_key_var.get() == API_KEY_MASK else self.api_key_var.get().strip(),
-            "transcription_prompt": self.get_transcription_prompt_text(),
+            "transcription_prompt": self.read_transcription_prompt_file(),
         }
 
         self.app_settings = settings
@@ -2324,6 +2331,8 @@ class App:
             self.add_log("文字起こしキューが空です。")
             self.current_transcription_var.set("文字起こし: キューが空です")
             return
+        prompt = self.refresh_transcription_prompt_setting()
+        self.add_log(f"文字起こしプロンプト: {'あり' if prompt else 'なし'}")
         self.transcription_running = True
         self.status_var.set("文字起こしキュー実行中")
         threading.Thread(target=self._run_transcription_queue_worker, daemon=True).start()
