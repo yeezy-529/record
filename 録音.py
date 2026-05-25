@@ -30,7 +30,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.03"
+APP_VERSION = "1.04"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,6 +76,7 @@ DEFAULT_SETTINGS = {
     "beam_size": BEAM_SIZE,
     "compute_type": COMPUTE_TYPE,
     "openai_api_key": "",
+    "transcription_prompt": "",
 }
 
 API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-4o-transcribe-diarize"}
@@ -743,6 +744,7 @@ class Transcriber:
         self.beam_size = BEAM_SIZE
         self.openai_api_key = ""
         self.openai_api_key_from_env = False
+        self.transcription_prompt = ""
         self.model_lock = threading.Lock()
 
     def resolve_api_key(self, user_api_key=""):
@@ -760,6 +762,7 @@ class Transcriber:
             model_size = settings["model_size"]
             compute_type = settings["compute_type"]
             self.resolve_api_key(settings.get("openai_api_key", ""))
+            self.transcription_prompt = (settings.get("transcription_prompt", "") or "").strip()
             if model_size != self.model_size or compute_type != self.compute_type:
                 self.model = None
             self.model_size = model_size
@@ -815,6 +818,7 @@ class Transcriber:
                     temperature=0.0,
                     condition_on_previous_text=False,
                     word_timestamps=False,
+                    initial_prompt=self.transcription_prompt or None,
                 )
 
                 for seg in segments:
@@ -990,6 +994,8 @@ class Transcriber:
             add_field("chunking_strategy", "auto")
         else:
             add_field("response_format", "json")
+            if self.transcription_prompt:
+                add_field("prompt", self.transcription_prompt)
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
@@ -1498,6 +1504,35 @@ class App:
         )
         self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
+        ttk.Label(settings_frame, text="文字起こしプロンプト", style="Card.TLabel").grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(4, 4),
+        )
+        self.prompt_text = tk.Text(
+            settings_frame,
+            height=4,
+            wrap="word",
+            relief="flat",
+            borderwidth=0,
+            bg=self.card_color,
+            fg=self.text_color,
+            insertbackground=self.accent_color,
+            font=("Yu Gothic UI", 9),
+        )
+        self.prompt_text.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        self.prompt_text.insert("1.0", self.app_settings["transcription_prompt"])
+        self.prompt_text.bind("<FocusOut>", self.on_transcription_setting_changed)
+        ttk.Label(
+            settings_frame,
+            text="固有名詞、専門用語、略語などを入力すると文字起こし時の参考情報として使います。",
+            style="Muted.Card.TLabel",
+            wraplength=340,
+            justify="left",
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+
         settings_frame.columnconfigure(1, weight=1)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.mode_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
@@ -1535,7 +1570,8 @@ class App:
         self.add_log(
             f"文字起こし設定: model={self.app_settings['model_size']}, "
             f"mode={self.app_settings['mode']}, beam_size={self.app_settings['beam_size']}, "
-            f"compute_type={self.app_settings['compute_type']}"
+            f"compute_type={self.app_settings['compute_type']}, "
+            f"prompt={'あり' if self.app_settings['transcription_prompt'] else 'なし'}"
         )
 
     def build_recording_view(self):
@@ -1742,7 +1778,7 @@ class App:
             "上記パターンでは、OpenAI APIモデルを使う経路があります。\n"
             "APIモデルを使う場合は、設定画面でOpenAI APIキーを設定してください。\n\n\n"
             "【設定画面】\n"
-            "文字起こしに使うモデル、処理モード、OpenAI APIキーを設定する画面です。\n\n"
+            "文字起こしに使うモデル、処理モード、プロンプト、OpenAI APIキーを設定する画面です。\n\n"
             "モデルは、文字起こしに使う方式を選びます。\n"
             "ローカルモデルはPC上で処理します。\n"
             "精度を重視する場合は large-v3 がおすすめです。\n"
@@ -1766,6 +1802,8 @@ class App:
             "  速度と精度のバランスを取ります。\n\n"
             "・高精度\n"
             "  精度を優先しますが、処理時間は長くなります。\n\n"
+            "文字起こしプロンプトには、固有名詞、専門用語、略語などを入力できます。\n"
+            "入力した内容は、ローカルモデルと対応しているOpenAI APIモデルの文字起こし時に参考情報として使われます。\n\n"
             "録音フォルダの文字起こしでは、追加時に選んだパターンに応じてモデルが自動選択されます。\n"
             "マニュアルパターンや動画文字起こしでは、ここで選んだモデル設定を使います。\n\n"
             "OpenAI APIモデルを使う場合はAPIキーが必要です。\n"
@@ -1784,12 +1822,24 @@ class App:
             self.api_key_entry.configure(state="normal")
             self.api_key_note_var.set("OPENAI_API_KEY環境変数が未設定のため、ここにAPIキーを入力してください。")
 
+    def get_transcription_prompt_text(self):
+        if not hasattr(self, "prompt_text"):
+            return ""
+        return self.prompt_text.get("1.0", "end").strip()
+
+    def set_transcription_prompt_text(self, value):
+        if not hasattr(self, "prompt_text"):
+            return
+        self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", value or "")
+
     def on_transcription_setting_changed(self, event=None):
         self.refresh_api_key_entry_state()
         if self.transcription_running:
             self.model_var.set(MODEL_CHOICES[self.app_settings["model_size"]])
             self.mode_var.set(self.app_settings["mode"])
             self.api_key_var.set(self.app_settings.get("openai_api_key", ""))
+            self.set_transcription_prompt_text(self.app_settings.get("transcription_prompt", ""))
             self.refresh_settings_summary()
             safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に変更してください。")
             return
@@ -1801,6 +1851,7 @@ class App:
             "beam_size": MODE_CHOICES[mode],
             "compute_type": COMPUTE_TYPE,
             "openai_api_key": "" if self.api_key_var.get() == API_KEY_MASK else self.api_key_var.get().strip(),
+            "transcription_prompt": self.get_transcription_prompt_text(),
         }
 
         self.app_settings = settings
@@ -1808,7 +1859,8 @@ class App:
         self.refresh_settings_summary()
         self.add_log(
             f"文字起こし設定を変更: model={settings['model_size']}, "
-            f"mode={settings['mode']}, beam_size={settings['beam_size']}"
+            f"mode={settings['mode']}, beam_size={settings['beam_size']}, "
+            f"prompt={'あり' if settings['transcription_prompt'] else 'なし'}"
         )
 
     def load_devices(self):
