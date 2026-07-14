@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 mtg_records/
+
+# PyInstaller の生成物（exe は大きすぎて Git に入らないため Release で配布する）
+build/
+dist/

@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import audioop
+import difflib
 import json
 import struct
 import threading
@@ -21,6 +22,7 @@ from pathlib import Path
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import customtkinter as ctk
 
 import pyaudiowpatch as pyaudio
 from faster_whisper import WhisperModel
@@ -31,7 +33,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.04"
+APP_VERSION = "1.06"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,6 +97,9 @@ API_CHUNK_BITRATE_BPS = 64000
 API_CHUNK_SECONDS = int(API_UPLOAD_SAFETY_BYTES * 8 / API_CHUNK_BITRATE_BPS * 0.92)
 API_OVERLAP_SECONDS = 3
 API_KEY_MASK = "******************"
+# 文字起こしAPI/ローカルモデルへ渡す言語ヒント。日本語であることを明示して
+# 英語混入や言語の取り違えを減らす。固有名詞（設定画面入力）と結合して使う。
+API_JAPANESE_PROMPT_HINT = "以下は日本語の会議音声です。"
 
 TRANSCRIPTION_PATTERNS = {
     "online_one_to_one": "オンラインMTG: 自分 + 相手1人",
@@ -857,10 +862,10 @@ class Transcriber:
                 rows = self._transcribe_file_api(audio_path, speaker_label, diarized_prefix=diarized_prefix)
             else:
                 self.preload_model()
-                # 固有名詞ヒントを initial_prompt に渡す。
+                # 言語ヒント + 固有名詞を initial_prompt に渡す。
                 # Whisper の prompt は末尾約224トークンのみ有効なため、
-                # 長すぎる場合は末尾側を優先して安全な長さに丸める。
-                initial_prompt = (self.vocab_prompt or "").strip() or None
+                # 長すぎる場合は末尾側（固有名詞側）を優先して丸める。
+                initial_prompt = self._build_api_prompt() or None
                 if initial_prompt and len(initial_prompt) > 200:
                     initial_prompt = initial_prompt[-200:]
                 segments, info = self.model.transcribe(
@@ -894,6 +899,7 @@ class Transcriber:
             for row in rows:
                 row.setdefault("source", source)
                 row.setdefault("model", self.model_size)
+            self._warn_possible_english(rows, speaker_label)
             self.log(f"文字起こし完了: {speaker_label}")
             return rows
 
@@ -1093,6 +1099,59 @@ class Transcriber:
             if 'temp_path' in locals() and temp_path.exists():
                 temp_path.unlink()
 
+    def _build_api_prompt(self):
+        # 言語ヒント（日本語）+ 固有名詞を結合したプロンプトを作る。
+        # 英語混入・言語の取り違え・固有名詞の誤変換を減らすヒントになる。
+        parts = [API_JAPANESE_PROMPT_HINT]
+        vocab = (getattr(self, "vocab_prompt", "") or "").strip()
+        if vocab:
+            parts.append(vocab)
+        return " ".join(p for p in parts if p).strip()
+
+    def _call_openai_transcription(self, audio_path):
+        # 公式 openai SDK 経由で文字起こしを実行する。
+        # SDK が 429/5xx を Retry-After 付き指数バックオフで自動再試行するため、
+        # 自前のHTTP実装・リトライループは不要になった。
+        api_key = self.resolve_api_key(self.openai_api_key)
+        if not api_key:
+            raise RuntimeError("APIモデル利用時はOpenAI APIキーを入力してください。")
+        try:
+            from openai import OpenAI
+            import openai as openai_mod
+        except Exception as e:
+            raise RuntimeError(
+                "OpenAI APIモデルを使うには openai パッケージが必要です。"
+                "`pip install openai` を実行してください。"
+            ) from e
+
+        client = OpenAI(api_key=api_key, max_retries=5, timeout=600.0)
+        kwargs = {"model": self.model_size, "language": LANGUAGE}
+        prompt = self._build_api_prompt()
+        if prompt:
+            kwargs["prompt"] = prompt
+        if self.model_size == "gpt-4o-transcribe-diarize":
+            kwargs["response_format"] = "diarized_json"
+            kwargs["chunking_strategy"] = "auto"
+        else:
+            kwargs["response_format"] = "json"
+            # 出力のブレを抑えるため温度を 0 にする（diarize は temperature 非対応）。
+            kwargs["temperature"] = 0
+
+        try:
+            with open(audio_path, "rb") as fh:
+                result = client.audio.transcriptions.create(file=fh, **kwargs)
+        except openai_mod.BadRequestError as e:
+            # 「input too large」等はチャンク分割側が文字列で検知するため保持する。
+            raise RuntimeError(str(e)) from e
+        except openai_mod.APIStatusError as e:
+            raise RuntimeError(f"OpenAI APIエラー (HTTP {e.status_code}): {e}") from e
+
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        if isinstance(result, dict):
+            return result
+        return {"text": str(result)}
+
     def _transcribe_api_single(
         self,
         audio_path,
@@ -1101,103 +1160,7 @@ class Transcriber:
         diarized_prefix=None,
         diarized_chunk_index=None,
     ):
-        api_key = self.resolve_api_key(self.openai_api_key)
-        boundary = f"----recordapp{uuid.uuid4().hex}"
-        audio_bytes = audio_path.read_bytes()
-        mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
-
-        parts = []
-
-        def add_field(name, value):
-            parts.append(f"--{boundary}\r\n".encode("utf-8"))
-            parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-            parts.append(f"{value}\r\n".encode("utf-8"))
-
-        add_field("model", self.model_size)
-        add_field("language", LANGUAGE)
-        if self.model_size == "gpt-4o-transcribe-diarize":
-            add_field("response_format", "diarized_json")
-            add_field("chunking_strategy", "auto")
-        else:
-            add_field("response_format", "json")
-            # 出力のブレを抑えるため温度を明示的に 0 にする。
-            # diarize モデルは temperature 非対応のため送らない。
-            add_field("temperature", "0")
-        # 固有名詞・専門用語のヒント（設定画面で入力）。
-        # 言語判定のブレや固有名詞の誤変換を減らす。
-        vocab_prompt = (getattr(self, "vocab_prompt", "") or "").strip()
-        if vocab_prompt:
-            add_field("prompt", vocab_prompt)
-
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append(
-            f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode("utf-8")
-        )
-        parts.append(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
-        parts.append(audio_bytes)
-        parts.append(b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/audio/transcriptions",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-        )
-        # 429（レート制限）や 5xx の一時エラーは指数バックオフで再試行する。
-        # system/mic を並列実行すると 429 を踏みやすいため、対応は重要。
-        max_attempts = 5
-        retry_status = {429, 500, 502, 503, 504}
-        last_error = None
-        for attempt in range(max_attempts):
-            try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as e:
-                err_body = ""
-                try:
-                    err_body = (e.read() or b"").decode("utf-8", errors="replace")
-                except Exception:
-                    err_body = ""
-                message = f"HTTP {e.code}: {err_body}" if err_body else f"HTTP {e.code}: {e.reason}"
-                if e.code == 400 and "input too large" in err_body.lower():
-                    raise RuntimeError(message)
-                if e.code in retry_status and attempt < max_attempts - 1:
-                    retry_after = None
-                    try:
-                        header_val = e.headers.get("Retry-After") if e.headers else None
-                        if header_val:
-                            retry_after = float(header_val)
-                    except Exception:
-                        retry_after = None
-                    wait_seconds = retry_after if retry_after is not None else min(30, 2 ** attempt)
-                    kind = "レート制限" if e.code == 429 else "API一時エラー"
-                    self.log(
-                        f"{kind}のため再試行します: {attempt + 1}/{max_attempts} "
-                        f"({wait_seconds:.0f}秒待機)"
-                    )
-                    threading.Event().wait(wait_seconds)
-                    continue
-                raise RuntimeError(message)
-            except urllib.error.URLError as e:
-                # タイムアウト・接続エラー等の一時的な失敗はリトライする。
-                last_error = e
-                if attempt >= max_attempts - 1:
-                    raise
-                wait_seconds = min(30, 2 ** attempt)
-                self.log(
-                    f"API接続エラーのため再試行します: {attempt + 1}/{max_attempts} "
-                    f"({wait_seconds}秒待機)"
-                )
-                threading.Event().wait(wait_seconds)
-        else:
-            if last_error:
-                raise last_error
+        payload = self._call_openai_transcription(audio_path)
 
         rows = []
         diarized_speakers = {}
@@ -1241,21 +1204,60 @@ class Transcriber:
     def _normalized_text(text):
         return re.sub(r"\s+", "", (text or "")).strip().lower()
 
+    @staticmethod
+    def _text_similarity(a, b):
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    @staticmethod
+    def _looks_like_english(text):
+        # 日本語文字を1つも含まず、ラテン文字だけがある程度続く行を
+        # 「英語が混入した可能性が高い」とみなす（保守的判定）。
+        t = (text or "").strip()
+        if len(t) < 8:
+            return False
+        latin = sum(1 for ch in t if "a" <= ch.lower() <= "z")
+        jp = sum(1 for ch in t if ("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff"))
+        return jp == 0 and latin >= 8
+
+    def _warn_possible_english(self, rows, speaker_label):
+        # 自動修正はせず、後で見直せるようにログへ警告を出すだけ。
+        for r in rows:
+            if self._looks_like_english(r.get("text", "")):
+                ts = self.fmt(r.get("start", 0.0))
+                snippet = (r.get("text", "") or "")[:40]
+                self.log(f"⚠ 英語が混入している可能性 [{ts}] {speaker_label}: {snippet}")
+
     def _merge_api_chunk_rows(self, existing_rows, chunk_rows):
         if not existing_rows or not chunk_rows:
             return existing_rows + chunk_rows
 
         merged = list(existing_rows)
-        prior_tail = existing_rows[-4:]
+        prior_tail = existing_rows[-6:]
         for row in chunk_rows:
             normalized = self._normalized_text(row.get("text", ""))
             duplicate = False
             if normalized:
+                r_start = float(row.get("start", 0.0))
+                r_end = float(row.get("end", r_start))
                 for old in prior_tail:
-                    same_speaker = old.get("speaker") == row.get("speaker")
-                    near_boundary = abs(float(old.get("start", 0.0)) - float(row.get("start", 0.0))) <= (API_OVERLAP_SECONDS * 2)
-                    duplicate = same_speaker and near_boundary and normalized == self._normalized_text(old.get("text", ""))
-                    if duplicate:
+                    o_start = float(old.get("start", 0.0))
+                    o_end = float(old.get("end", o_start))
+                    # 時間帯が近接/重複している境界付近のみ重複候補とみなす。
+                    near = (r_start <= o_end + API_OVERLAP_SECONDS) and (o_start <= r_end + API_OVERLAP_SECONDS)
+                    if not near:
+                        continue
+                    old_norm = self._normalized_text(old.get("text", ""))
+                    # 完全一致だけでなく、高い類似度や包含関係も重複とみなす。
+                    # APIは同じ区間でも毎回わずかに違う書き起こしを返すため、
+                    # 完全一致のみだと重複が二重に残りやすい。
+                    if old_norm and (
+                        normalized == old_norm
+                        or self._text_similarity(normalized, old_norm) >= 0.82
+                        or (len(normalized) >= 6 and (normalized in old_norm or old_norm in normalized))
+                    ):
+                        duplicate = True
                         break
             if not duplicate:
                 merged.append(row)
@@ -1316,39 +1318,25 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("430x480")
-        self.root.minsize(400, 480)
-        self.bg_color = "#fff8fb"
-        self.card_color = "#ffffff"
-        self.text_color = "#1f2937"
-        self.muted_color = "#6b7280"
+        self.root.geometry("460x580")
+        self.root.minsize(430, 540)
+
+        # 配色。(light, dark) タプルはライト/ダーク両モードに自動対応する。
         self.accent_color = "#ff5c8a"
+        self.accent_hover = "#ff3d73"
         self.accent_soft = "#ffe7ef"
-        self.border_color = "#f8cdd9"
-        self.style = ttk.Style()
-        self.style.theme_use("clam")
-        self.style.configure("TNotebook", background=self.bg_color, borderwidth=0)
-        self.style.configure("TNotebook.Tab", padding=(26, 11), font=("Yu Gothic UI", 9), borderwidth=0)
-        self.style.map(
-            "TNotebook.Tab",
-            foreground=[("selected", self.accent_color), ("!selected", self.text_color)],
-            background=[("selected", "#fff0f5"), ("!selected", "#ffffff")],
-        )
-        self.style.configure("Tab.TFrame", background=self.bg_color)
-        self.style.configure("TFrame", background=self.bg_color)
-        self.style.configure("Card.TFrame", background=self.card_color)
-        self.style.configure("TLabel", background=self.bg_color, foreground=self.text_color, font=("Yu Gothic UI", 9))
-        self.style.configure("Card.TLabel", background=self.card_color, foreground=self.text_color, font=("Yu Gothic UI", 9))
-        self.style.configure("Muted.Card.TLabel", background=self.card_color, foreground=self.muted_color, font=("Yu Gothic UI", 8))
-        self.style.configure("Title.TLabel", background=self.bg_color, foreground=self.text_color, font=("Yu Gothic UI", 15, "bold"))
-        self.style.configure("Section.Card.TLabel", background=self.card_color, foreground=self.text_color, font=("Yu Gothic UI", 10, "bold"))
-        self.style.configure("Accent.TButton", foreground=self.accent_color, font=("Yu Gothic UI", 9, "bold"), padding=(14, 8))
-        self.style.configure("Primary.TButton", foreground="#ffffff", background=self.accent_color, font=("Yu Gothic UI", 9, "bold"), padding=(14, 9))
-        self.style.configure("Small.Primary.TButton", foreground="#ffffff", background=self.accent_color, font=("Yu Gothic UI", 8, "bold"), padding=(10, 6))
-        self.style.configure("Small.TButton", font=("Yu Gothic UI", 8), padding=(10, 6))
-        self.style.map("Primary.TButton", background=[("active", "#ff477d"), ("disabled", "#f3c4d1")])
-        self.style.map("Small.Primary.TButton", background=[("active", "#ff477d"), ("disabled", "#f3c4d1")])
-        self.style.configure("Soft.Horizontal.TProgressbar", troughcolor="#ffe6ee", background=self.accent_color, bordercolor="#ffe6ee", lightcolor=self.accent_color, darkcolor=self.accent_color)
+        self.text_color = ("#1f2937", "#e8e8ea")
+        self.muted_color = ("#6b7280", "#9aa0a6")
+        self.card_color = ("#ffffff", "#2b2b2d")
+        self.bg_color = ("#fff8fb", "#1b1b1d")
+        self.border_color = ("#f4d9e2", "#3a3a3d")
+
+        self.font_body = ("Yu Gothic UI", 13)
+        self.font_small = ("Yu Gothic UI", 12)
+        self.font_section = ("Yu Gothic UI", 14, "bold")
+        self.font_title = ("Yu Gothic UI", 20, "bold")
+
+        self.root.configure(fg_color=self.bg_color)
 
         self.main_thread_id = threading.get_ident()
 
@@ -1359,6 +1347,8 @@ class App:
 
         self.system_devices = []
         self.mic_devices = []
+        self._system_values = []
+        self._mic_values = []
 
         self.status_var = tk.StringVar(value="起動中")
         self.timer_var = tk.StringVar(value="録音時間: 00:00")
@@ -1369,6 +1359,8 @@ class App:
         self.mode_var = tk.StringVar(value=self.app_settings["mode"])
         self.api_key_var = tk.StringVar(value=self.app_settings["openai_api_key"])
         self.vocab_prompt_var = tk.StringVar(value=self.app_settings.get("vocab_prompt", ""))
+        self.system_device_var = tk.StringVar()
+        self.mic_device_var = tk.StringVar()
         self.settings_summary_var = tk.StringVar()
         self.recording_system_device_var = tk.StringVar(value="相手音声")
         self.recording_mic_device_var = tk.StringVar(value="マイク")
@@ -1399,307 +1391,209 @@ class App:
 
         self.root.after(100, self.load_devices)
 
-    def _card(self, parent, padx=14, pady=14):
-        card = tk.Frame(
+    def _mode_color(self, light, dark):
+        return dark if ctk.get_appearance_mode() == "Dark" else light
+
+    def _option_index(self, value, values):
+        try:
+            return list(values).index(value)
+        except (ValueError, TypeError):
+            return -1
+
+    def _card(self, parent):
+        return ctk.CTkFrame(
             parent,
-            bg=self.card_color,
-            bd=0,
-            highlightthickness=1,
-            highlightbackground="#f4d9e2",
-            highlightcolor="#f4d9e2",
+            fg_color=self.card_color,
+            corner_radius=14,
+            border_width=1,
+            border_color=self.border_color,
         )
-        inner = ttk.Frame(card, style="Card.TFrame", padding=(padx, pady))
-        inner.pack(fill="both", expand=True)
-        return card, inner
+
+    def _primary_button(self, parent, text, command, **kwargs):
+        return ctk.CTkButton(
+            parent, text=text, command=command,
+            fg_color=self.accent_color, hover_color=self.accent_hover, **kwargs
+        )
+
+    def _ghost_button(self, parent, text, command, border=None, **kwargs):
+        return ctk.CTkButton(
+            parent, text=text, command=command,
+            fg_color="transparent", text_color=self.accent_color,
+            hover_color=self.accent_soft, border_width=1,
+            border_color=border or self.accent_color, **kwargs
+        )
+
+    def _option_menu(self, parent, variable, values, command):
+        return ctk.CTkOptionMenu(
+            parent, variable=variable, values=values, command=command,
+            fg_color=self.accent_color, button_color=self.accent_color,
+            button_hover_color=self.accent_hover, font=self.font_small,
+            dynamic_resizing=False,
+        )
 
     def build_ui(self):
-        self.root.configure(bg=self.bg_color)
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=14, pady=14)
-
-        home_tab = ttk.Frame(self.notebook, style="Tab.TFrame")
-        analysis_tab = ttk.Frame(self.notebook, style="Tab.TFrame")
-        settings_tab = ttk.Frame(self.notebook, style="Tab.TFrame")
-
-        self.notebook.add(home_tab, text="⌂  ホーム")
-        self.notebook.add(analysis_tab, text="▥  分析")
-        self.notebook.add(settings_tab, text="⚙  設定")
-
-        top_frame = ttk.Frame(home_tab, padding=(4, 4, 4, 12), style="Tab.TFrame")
-        top_frame.pack(fill="x")
-
-        self.status_banner = tk.Frame(
-            top_frame,
-            bg="#ffffff",
-            highlightthickness=1,
-            highlightbackground="#f4d9e2",
-            highlightcolor="#f4d9e2",
+        self.tabview = ctk.CTkTabview(
+            self.root,
+            fg_color=self.bg_color,
+            segmented_button_selected_color=self.accent_color,
+            segmented_button_selected_hover_color=self.accent_hover,
         )
-        self.status_banner.pack(fill="x")
-        self.status_title_label = tk.Label(
-            self.status_banner,
-            textvariable=self.status_title_var,
-            bg="#ffffff",
-            fg=self.text_color,
-            font=("Yu Gothic UI", 15, "bold"),
-            anchor="w",
-            padx=14,
-            pady=8,
+        self.tabview.pack(fill="both", expand=True, padx=14, pady=(6, 14))
+
+        home_tab = self.tabview.add("ホーム")
+        analysis_tab = self.tabview.add("分析")
+        settings_tab = self.tabview.add("設定")
+
+        # ---- ホーム ----
+        self.status_banner = ctk.CTkFrame(
+            home_tab, fg_color=self.card_color, corner_radius=14,
+            border_width=1, border_color=self.border_color,
         )
-        self.status_title_label.pack(fill="x")
-        self.status_detail_label = tk.Label(
-            self.status_banner,
-            textvariable=self.status_detail_var,
-            bg="#ffffff",
-            fg=self.muted_color,
-            font=("Yu Gothic UI", 9),
-            anchor="w",
-            padx=14,
-            pady=6,
+        self.status_banner.pack(fill="x", pady=(4, 12))
+        self.status_title_label = ctk.CTkLabel(
+            self.status_banner, textvariable=self.status_title_var,
+            font=self.font_title, text_color=self.text_color, anchor="w",
+            fg_color="transparent",
         )
-        self.status_detail_label.pack(fill="x")
-        self.current_transcription_label = tk.Label(
-            self.status_banner,
-            textvariable=self.current_transcription_var,
-            bg="#ffffff",
-            fg=self.muted_color,
-            font=("Yu Gothic UI", 8),
-            anchor="w",
-            padx=14,
-            pady=6,
+        self.status_title_label.pack(fill="x", padx=16, pady=(12, 2))
+        self.status_detail_label = ctk.CTkLabel(
+            self.status_banner, textvariable=self.status_detail_var,
+            font=self.font_body, text_color=self.muted_color, anchor="w",
+            fg_color="transparent",
         )
-        self.current_transcription_label.pack(fill="x")
+        self.status_detail_label.pack(fill="x", padx=16, pady=(0, 2))
+        self.current_transcription_label = ctk.CTkLabel(
+            self.status_banner, textvariable=self.current_transcription_var,
+            font=self.font_small, text_color=self.muted_color, anchor="w",
+            fg_color="transparent",
+        )
+        self.current_transcription_label.pack(fill="x", padx=16, pady=(0, 12))
         self.refresh_status_banner()
 
-        device_card, device_frame = self._card(home_tab)
+        device_card = self._card(home_tab)
         device_card.pack(fill="x", pady=(0, 10))
-        ttk.Label(device_frame, text="🎙  録音デバイス選択", style="Section.Card.TLabel").grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(0, 12),
-        )
+        ctk.CTkLabel(device_card, text="🎙  録音デバイス選択", font=self.font_section,
+                     text_color=self.text_color, anchor="w").pack(fill="x", padx=14, pady=(12, 8))
+        ctk.CTkLabel(device_card, text="スピーカー / 相手音声", font=self.font_small,
+                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=14)
+        self.system_combo = self._option_menu(device_card, self.system_device_var,
+                                               ["(読み込み中)"], self.on_device_changed)
+        self.system_combo.pack(fill="x", padx=14, pady=(4, 10))
+        ctk.CTkLabel(device_card, text="マイク / 自分の声", font=self.font_small,
+                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=14)
+        self.mic_combo = self._option_menu(device_card, self.mic_device_var,
+                                            ["(読み込み中)"], self.on_device_changed)
+        self.mic_combo.pack(fill="x", padx=14, pady=(4, 10))
+        self.reload_btn = self._ghost_button(device_card, "⟳  デバイス再読み込み",
+                                             self.load_devices, font=self.font_small, height=32)
+        self.reload_btn.pack(anchor="e", padx=14, pady=(2, 12))
 
-        ttk.Label(device_frame, text="スピーカー / 相手音声:", style="Card.TLabel").grid(
-            row=1,
-            column=0,
-            sticky="w"
-        )
-
-        self.system_combo = ttk.Combobox(
-            device_frame,
-            state="readonly",
-            width=80
-        )
-        self.system_combo.grid(row=2, column=0, columnspan=2, pady=(4, 10), sticky="ew")
-
-        ttk.Label(device_frame, text="マイク / 自分の声:", style="Card.TLabel").grid(
-            row=3,
-            column=0,
-            sticky="w"
-        )
-
-        self.mic_combo = ttk.Combobox(
-            device_frame,
-            state="readonly",
-            width=80
-        )
-        self.mic_combo.grid(row=4, column=0, columnspan=2, pady=(4, 10), sticky="ew")
-
-        self.system_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
-        self.mic_combo.bind("<<ComboboxSelected>>", self.on_device_changed)
-
-        self.reload_btn = ttk.Button(
-            device_frame,
-            text="⟳  デバイス再読み込み",
-            style="Accent.TButton",
-            command=self.load_devices
-        )
-        self.reload_btn.grid(row=5, column=1, sticky="e", pady=(2, 0))
-
-        device_frame.columnconfigure(0, weight=1)
-        device_frame.columnconfigure(1, weight=0)
-
-        btn_frame = ttk.Frame(home_tab, padding=(0, 0, 0, 6), style="Tab.TFrame")
-        btn_frame.pack(fill="x")
-
-        self.start_btn = ttk.Button(
-            btn_frame,
-            text="◎  録音開始",
-            style="Primary.TButton",
-            command=self.start_recording,
-            state="disabled"
-        )
-        self.start_btn.pack(fill="x")
+        self.start_btn = self._primary_button(home_tab, "●  録音開始", self.start_recording,
+                                              font=("Yu Gothic UI", 15, "bold"), height=46)
+        self.start_btn.configure(state="disabled")
+        self.start_btn.pack(fill="x", pady=(2, 6))
 
         self.build_recording_view()
 
-        analysis_top_frame = ttk.Frame(analysis_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
-        analysis_top_frame.pack(fill="x")
-        self.start_transcribe_btn = ttk.Button(
-            analysis_top_frame,
-            text="✐  文字起こし開始",
-            style="Accent.TButton",
-            command=self.start_transcription_queue,
-            state="normal"
-        )
+        # ---- 分析 ----
+        analysis_top = ctk.CTkFrame(analysis_tab, fg_color="transparent")
+        analysis_top.pack(fill="x", pady=(8, 10))
+        self.start_transcribe_btn = self._primary_button(analysis_top, "✐  文字起こし開始",
+                                                         self.start_transcription_queue,
+                                                         font=self.font_body, height=38)
         self.start_transcribe_btn.pack(side="left")
-        self.open_folder_btn = ttk.Button(
-            analysis_top_frame,
-            text="□  録音フォルダを開く",
-            style="Small.TButton",
-            command=self.open_output_folder,
-            state="normal",
-        )
+        self.open_folder_btn = self._ghost_button(analysis_top, "🗀  録音フォルダを開く",
+                                                  self.open_output_folder, font=self.font_small, height=32)
         self.open_folder_btn.pack(side="left", padx=(10, 0))
 
-        ttk.Label(analysis_tab, text="文字起こしキュー", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
-        self.queue_count_label = ttk.Label(analysis_tab, text="追加済みファイル（0 件）", font=("Yu Gothic UI", 10, "bold"))
-        self.queue_count_label.pack(anchor="w", padx=4, pady=(0, 8))
-        list_card, list_frame = self._card(analysis_tab, padx=12, pady=12)
+        self.queue_count_label = ctk.CTkLabel(analysis_tab, text="追加済みファイル（0 件）",
+                                              font=self.font_section, text_color=self.text_color, anchor="w")
+        self.queue_count_label.pack(anchor="w", padx=4, pady=(0, 6))
+
+        list_card = self._card(analysis_tab)
         list_card.pack(fill="both", expand=True, pady=(0, 8))
         self.queue_listbox = tk.Listbox(
-            list_frame,
-            height=8,
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=0,
-            bg=self.card_color,
-            fg=self.text_color,
-            selectbackground=self.accent_soft,
-            selectforeground=self.text_color,
-            font=("Yu Gothic UI", 9),
+            list_card, height=8, relief="flat", borderwidth=0, highlightthickness=0,
+            bg=self._mode_color("#ffffff", "#2b2b2d"),
+            fg=self._mode_color("#1f2937", "#e8e8ea"),
+            selectbackground=self.accent_soft, selectforeground="#1f2937",
+            font=("Yu Gothic UI", 12),
         )
-        self.queue_listbox.pack(fill="both", expand=True)
+        self.queue_listbox.pack(fill="both", expand=True, padx=12, pady=12)
 
-        queue_btn_frame = ttk.Frame(analysis_tab, style="Tab.TFrame")
+        queue_btn_frame = ctk.CTkFrame(analysis_tab, fg_color="transparent")
         queue_btn_frame.pack(fill="x", pady=(0, 12))
-        ttk.Button(
-            queue_btn_frame,
-            text="+  フォルダ追加",
-            style="Small.Primary.TButton",
-            command=self.add_queue_from_dialog,
-            width=13,
-        ).pack(side="left")
-        ttk.Button(
-            queue_btn_frame,
-            text="▶  動画追加",
-            style="Small.Primary.TButton",
-            command=self.add_video_queue_from_dialog,
-            width=13,
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            queue_btn_frame,
-            text="♲  選択削除",
-            style="Small.TButton",
-            command=self.remove_selected_queue,
-            width=12,
-        ).pack(side="left", padx=(8, 0))
+        self._primary_button(queue_btn_frame, "＋ フォルダ追加", self.add_queue_from_dialog,
+                             font=self.font_small, width=120).pack(side="left")
+        self._primary_button(queue_btn_frame, "▶ 動画追加", self.add_video_queue_from_dialog,
+                             font=self.font_small, width=110).pack(side="left", padx=(8, 0))
+        self._ghost_button(queue_btn_frame, "🗑 選択削除", self.remove_selected_queue,
+                          font=self.font_small, width=110).pack(side="left", padx=(8, 0))
 
-        settings_top_frame = ttk.Frame(settings_tab, padding=(4, 24, 4, 12), style="Tab.TFrame")
-        settings_top_frame.pack(fill="x")
-        settings_version_frame = ttk.Frame(settings_top_frame, style="Tab.TFrame")
-        settings_version_frame.pack(side="right", anchor="n")
-        ttk.Label(
-            settings_version_frame,
-            text=f"v{APP_VERSION}",
-            style="TLabel",
-        ).pack(anchor="e")
-        ttk.Button(
-            settings_version_frame,
-            text="アプリ説明",
-            style="Small.TButton",
-            command=self.show_app_description,
-        ).pack(anchor="e", pady=(4, 0))
+        # ---- 設定 ----
+        settings_top = ctk.CTkFrame(settings_tab, fg_color="transparent")
+        settings_top.pack(fill="x", pady=(8, 10))
+        self.open_error_btn = self._ghost_button(settings_top, "▤  エラーログを開く",
+                                                 self.open_error_log, font=self.font_small, height=32)
+        self.open_error_btn.pack(side="left")
+        settings_right = ctk.CTkFrame(settings_top, fg_color="transparent")
+        settings_right.pack(side="right")
+        ctk.CTkLabel(settings_right, text=f"v{APP_VERSION}", font=self.font_small,
+                     text_color=self.muted_color).pack(anchor="e")
+        self._ghost_button(settings_right, "アプリ説明", self.show_app_description,
+                          border=self.border_color, font=self.font_small,
+                          width=90, height=28).pack(anchor="e", pady=(4, 0))
 
-        settings_card, settings_frame = self._card(settings_tab, padx=12, pady=12)
+        settings_card = self._card(settings_tab)
         settings_card.pack(fill="x", pady=(0, 12))
-        ttk.Label(settings_frame, text="文字起こし設定", style="Section.Card.TLabel").grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            pady=(0, 12),
-        )
-        ttk.Label(settings_frame, text="モデル", style="Card.TLabel").grid(row=1, column=0, sticky="w")
-        self.model_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.model_var,
-            values=list(MODEL_CHOICES.values()),
-            state="readonly",
-            width=30,
-        )
-        self.model_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
-
-        ttk.Label(settings_frame, text="処理モード", style="Card.TLabel").grid(row=2, column=0, sticky="w")
-        self.mode_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.mode_var,
-            values=list(MODE_CHOICES.keys()),
-            state="readonly",
-            width=30,
-        )
-        self.mode_combo.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
-
-        ttk.Label(settings_frame, text="OpenAI APIキー", style="Card.TLabel").grid(row=3, column=0, sticky="w")
-        self.api_key_entry = ttk.Entry(settings_frame, textvariable=self.api_key_var, width=30, show="*")
-        self.api_key_entry.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+        settings_frame = ctk.CTkFrame(settings_card, fg_color="transparent")
+        settings_frame.pack(fill="x", padx=14, pady=14)
+        ctk.CTkLabel(settings_frame, text="文字起こし設定", font=self.font_section,
+                     text_color=self.text_color, anchor="w").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        ctk.CTkLabel(settings_frame, text="モデル", font=self.font_body,
+                     text_color=self.text_color).grid(row=1, column=0, sticky="w", pady=4)
+        self.model_combo = self._option_menu(settings_frame, self.model_var,
+                                              list(MODEL_CHOICES.values()), self.on_transcription_setting_changed)
+        self.model_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=4)
+        ctk.CTkLabel(settings_frame, text="処理モード", font=self.font_body,
+                     text_color=self.text_color).grid(row=2, column=0, sticky="w", pady=4)
+        self.mode_combo = self._option_menu(settings_frame, self.mode_var,
+                                             list(MODE_CHOICES.keys()), self.on_transcription_setting_changed)
+        self.mode_combo.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=4)
+        ctk.CTkLabel(settings_frame, text="OpenAI APIキー", font=self.font_body,
+                     text_color=self.text_color).grid(row=3, column=0, sticky="w", pady=4)
+        self.api_key_entry = ctk.CTkEntry(settings_frame, textvariable=self.api_key_var,
+                                           show="*", font=self.font_small)
+        self.api_key_entry.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=4)
         self.api_key_entry.bind("<FocusOut>", self.on_transcription_setting_changed)
         self.api_key_note_var = tk.StringVar()
-        self.api_key_note_label = ttk.Label(
-            settings_frame,
-            textvariable=self.api_key_note_var,
-            style="Muted.Card.TLabel",
-            wraplength=340,
-            justify="left",
-        )
+        self.api_key_note_label = ctk.CTkLabel(settings_frame, textvariable=self.api_key_note_var,
+                                               font=self.font_small, text_color=self.muted_color,
+                                               wraplength=360, justify="left", anchor="w")
         self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
-        ttk.Label(settings_frame, text="固有名詞・専門用語", style="Card.TLabel").grid(row=5, column=0, sticky="nw")
-        self.vocab_prompt_entry = ttk.Entry(settings_frame, textvariable=self.vocab_prompt_var, width=30)
-        self.vocab_prompt_entry.grid(row=5, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+        ctk.CTkLabel(settings_frame, text="固有名詞・専門用語", font=self.font_body,
+                     text_color=self.text_color).grid(row=5, column=0, sticky="nw", pady=4)
+        self.vocab_prompt_entry = ctk.CTkEntry(settings_frame, textvariable=self.vocab_prompt_var,
+                                               font=self.font_small)
+        self.vocab_prompt_entry.grid(row=5, column=1, sticky="ew", padx=(12, 0), pady=4)
         self.vocab_prompt_entry.bind("<FocusOut>", self.on_transcription_setting_changed)
-        ttk.Label(
-            settings_frame,
-            text="会議でよく出る固有名詞・専門用語をカンマ区切りで入力すると、"
-                 "文字起こしの誤変換や言語の取り違えを減らせます"
-                 "（例: 伴走型DX相談, IPA, 西端, ハピネス社）。",
-            style="Muted.Card.TLabel",
-            wraplength=340,
-            justify="left",
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-
+        ctk.CTkLabel(settings_frame,
+                     text="会議でよく出る固有名詞・専門用語をカンマ区切りで入力すると、"
+                          "文字起こしの誤変換や言語の取り違えを減らせます"
+                          "（例: 伴走型DX相談, IPA, 西端, ハピネス社）。",
+                     font=self.font_small, text_color=self.muted_color, wraplength=360,
+                     justify="left", anchor="w").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         settings_frame.columnconfigure(1, weight=1)
-        self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
-        self.mode_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
         self.refresh_api_key_entry_state()
         self.refresh_settings_summary()
 
-        self.open_error_btn = ttk.Button(
-            settings_top_frame,
-            text="▤  エラーログを開く",
-            style="Accent.TButton",
-            command=self.open_error_log
-        )
-        self.open_error_btn.pack(side="left")
-
-        ttk.Label(settings_tab, text="ログ", font=("Yu Gothic UI", 10, "bold")).pack(anchor="w", padx=4, pady=(0, 8))
-        log_card, log_frame = self._card(settings_tab, padx=12, pady=12)
-        log_card.pack(fill="both", expand=True, pady=(0, 0))
-
-        self.log_text = tk.Text(
-            log_frame,
-            height=20,
-            wrap="word",
-            relief="flat",
-            borderwidth=0,
-            bg=self.card_color,
-            fg=self.text_color,
-            insertbackground=self.accent_color,
-            font=("Yu Gothic UI", 9),
-        )
-        self.log_text.pack(fill="both", expand=True)
+        ctk.CTkLabel(settings_tab, text="ログ", font=self.font_section,
+                     text_color=self.text_color, anchor="w").pack(anchor="w", padx=4, pady=(0, 6))
+        log_card = self._card(settings_tab)
+        log_card.pack(fill="both", expand=True)
+        self.log_text = ctk.CTkTextbox(log_card, wrap="word", font=("Yu Gothic UI", 12),
+                                       fg_color="transparent", text_color=self.text_color)
+        self.log_text.pack(fill="both", expand=True, padx=12, pady=12)
 
         self.add_log("アプリを起動しました。")
         self.add_log(f"録音フォルダ: {BASE_DIR}")
@@ -1711,106 +1605,72 @@ class App:
         )
 
     def build_recording_view(self):
-        self.recording_frame = ttk.Frame(self.root, style="Tab.TFrame", padding=14)
+        self.recording_frame = ctk.CTkFrame(self.root, fg_color=self.bg_color)
 
-        self.recording_stop_btn = ttk.Button(
-            self.recording_frame,
-            text="停止",
-            style="Primary.TButton",
-            command=self.stop_recording,
-        )
-        self.recording_stop_btn.pack(anchor="w", pady=(0, 12))
+        self.recording_stop_btn = self._primary_button(self.recording_frame, "■  停止",
+                                                       self.stop_recording,
+                                                       font=("Yu Gothic UI", 15, "bold"), height=46)
+        self.recording_stop_btn.pack(fill="x", pady=(0, 12))
 
-        levels_frame = ttk.Frame(self.recording_frame, style="Tab.TFrame")
+        levels_frame = ctk.CTkFrame(self.recording_frame, fg_color="transparent")
         levels_frame.pack(fill="x", pady=(0, 12))
 
-        system_card, system_frame = self._card(levels_frame, padx=10, pady=10)
+        system_card = self._card(levels_frame)
         system_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        ttk.Label(system_frame, text="相手音声", style="Section.Card.TLabel").pack(anchor="w")
-        self.recording_system_device_label = ttk.Label(
-            system_frame,
-            textvariable=self.recording_system_device_var,
-            style="Muted.Card.TLabel",
-            wraplength=170,
-            justify="left",
+        ctk.CTkLabel(system_card, text="相手音声", font=self.font_section,
+                     text_color=self.text_color, anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        self.recording_system_device_label = ctk.CTkLabel(
+            system_card, textvariable=self.recording_system_device_var,
+            font=self.font_small, text_color=self.muted_color, wraplength=180,
+            justify="left", anchor="w",
         )
-        self.recording_system_device_label.pack(anchor="w", fill="x", pady=(6, 4))
-        system_meter_frame = ttk.Frame(system_frame, style="Card.TFrame")
-        system_meter_frame.pack(fill="x")
-        self.recording_system_bar = ttk.Progressbar(
-            system_meter_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100,
-            style="Soft.Horizontal.TProgressbar",
-        )
+        self.recording_system_device_label.pack(fill="x", padx=12, pady=(0, 6))
+        sys_meter = ctk.CTkFrame(system_card, fg_color="transparent")
+        sys_meter.pack(fill="x", padx=12, pady=(0, 12))
+        self.recording_system_bar = ctk.CTkProgressBar(sys_meter, progress_color=self.accent_color, height=14)
+        self.recording_system_bar.set(0)
         self.recording_system_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Label(
-            system_meter_frame,
-            textvariable=self.recording_system_percent_var,
-            style="Card.TLabel",
-            width=4,
-            anchor="e",
-        ).pack(side="right")
+        ctk.CTkLabel(sys_meter, textvariable=self.recording_system_percent_var, font=self.font_small,
+                     text_color=self.text_color, width=44, anchor="e").pack(side="right")
 
-        mic_card, mic_frame = self._card(levels_frame, padx=10, pady=10)
+        mic_card = self._card(levels_frame)
         mic_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        ttk.Label(mic_frame, text="マイク", style="Section.Card.TLabel").pack(anchor="w")
-        self.recording_mic_device_label = ttk.Label(
-            mic_frame,
-            textvariable=self.recording_mic_device_var,
-            style="Muted.Card.TLabel",
-            wraplength=170,
-            justify="left",
+        ctk.CTkLabel(mic_card, text="マイク", font=self.font_section,
+                     text_color=self.text_color, anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        self.recording_mic_device_label = ctk.CTkLabel(
+            mic_card, textvariable=self.recording_mic_device_var,
+            font=self.font_small, text_color=self.muted_color, wraplength=180,
+            justify="left", anchor="w",
         )
-        self.recording_mic_device_label.pack(anchor="w", fill="x", pady=(6, 4))
-        mic_meter_frame = ttk.Frame(mic_frame, style="Card.TFrame")
-        mic_meter_frame.pack(fill="x")
-        self.recording_mic_bar = ttk.Progressbar(
-            mic_meter_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100,
-            style="Soft.Horizontal.TProgressbar",
-        )
+        self.recording_mic_device_label.pack(fill="x", padx=12, pady=(0, 6))
+        mic_meter = ctk.CTkFrame(mic_card, fg_color="transparent")
+        mic_meter.pack(fill="x", padx=12, pady=(0, 12))
+        self.recording_mic_bar = ctk.CTkProgressBar(mic_meter, progress_color=self.accent_color, height=14)
+        self.recording_mic_bar.set(0)
         self.recording_mic_bar.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Label(
-            mic_meter_frame,
-            textvariable=self.recording_mic_percent_var,
-            style="Card.TLabel",
-            width=4,
-            anchor="e",
-        ).pack(side="right")
+        ctk.CTkLabel(mic_meter, textvariable=self.recording_mic_percent_var, font=self.font_small,
+                     text_color=self.text_color, width=44, anchor="e").pack(side="right")
 
         levels_frame.columnconfigure(0, weight=1)
         levels_frame.columnconfigure(1, weight=1)
 
-        memo_card, memo_frame = self._card(self.recording_frame, padx=10, pady=10)
+        memo_card = self._card(self.recording_frame)
         memo_card.pack(fill="both", expand=True)
-        self.memo_text = tk.Text(
-            memo_frame,
-            height=12,
-            wrap="word",
-            relief="flat",
-            borderwidth=0,
-            bg=self.card_color,
-            fg=self.text_color,
-            insertbackground=self.accent_color,
-            font=("Yu Gothic UI", 10),
-        )
-        self.memo_text.pack(fill="both", expand=True)
+        self.memo_text = ctk.CTkTextbox(memo_card, wrap="word", font=("Yu Gothic UI", 13),
+                                        fg_color="transparent", text_color=self.text_color)
+        self.memo_text.pack(fill="both", expand=True, padx=12, pady=12)
 
     def show_recording_view(self):
-        self.notebook.pack_forget()
-        self.recording_frame.pack(fill="both", expand=True)
+        self.tabview.pack_forget()
+        self.recording_frame.pack(fill="both", expand=True, padx=14, pady=(6, 14))
 
     def show_main_view(self):
         self.recording_frame.pack_forget()
-        self.notebook.pack(fill="both", expand=True, padx=14, pady=14)
+        self.tabview.pack(fill="both", expand=True, padx=14, pady=(6, 14))
 
     def update_recording_device_labels(self):
-        system_name = self.system_combo.get() or "相手音声"
-        mic_name = self.mic_combo.get() or "マイク"
+        system_name = self.system_device_var.get() or "相手音声"
+        mic_name = self.mic_device_var.get() or "マイク"
         self.recording_system_device_var.set(system_name)
         self.recording_mic_device_var.set(mic_name)
         self.update_recording_level_values(self.recorder.system_level, self.recorder.mic_level)
@@ -1819,9 +1679,9 @@ class App:
         self.recording_system_percent_var.set(f"{system_level}%")
         self.recording_mic_percent_var.set(f"{mic_level}%")
         if hasattr(self, "recording_system_bar"):
-            self.recording_system_bar["value"] = system_level
+            self.recording_system_bar.set(max(0, min(100, system_level)) / 100)
         if hasattr(self, "recording_mic_bar"):
-            self.recording_mic_bar["value"] = mic_level
+            self.recording_mic_bar.set(max(0, min(100, mic_level)) / 100)
 
     def save_recording_memo(self, output_dir):
         memo = self.memo_text.get("1.0", "end").strip()
@@ -2001,29 +1861,31 @@ class App:
                 for d in self.mic_devices
             ]
 
-            self.system_combo["values"] = system_names
-            self.mic_combo["values"] = mic_names
+            self._system_values = system_names
+            self._mic_values = mic_names
+            self.system_combo.configure(values=system_names or ["loopbackデバイスが見つかりません"])
+            self.mic_combo.configure(values=mic_names or ["おすすめマイクが見つかりません"])
 
             if system_names:
-                self.system_combo.current(0)
+                self.system_device_var.set(system_names[0])
             else:
-                self.system_combo.set("loopbackデバイスが見つかりません")
+                self.system_device_var.set("loopbackデバイスが見つかりません")
 
             if mic_names:
-                self.mic_combo.current(0)
+                self.mic_device_var.set(mic_names[0])
             else:
-                self.mic_combo.set("おすすめマイクが見つかりません")
+                self.mic_device_var.set("おすすめマイクが見つかりません")
 
             self.add_log("録音デバイスを読み込みました。")
             self.add_log(f"相手音声候補: {len(self.system_devices)} 件")
             self.add_log(f"おすすめマイク候補: {len(self.mic_devices)} 件")
 
             if self.system_devices and self.mic_devices:
-                self.start_btn.config(state="normal")
+                self.start_btn.configure(state="normal")
                 self.status_var.set("待機中")
                 self.schedule_preview_level_meter()
             else:
-                self.start_btn.config(state="disabled")
+                self.start_btn.configure(state="disabled")
                 self.status_var.set("デバイス未検出")
 
         except Exception as e:
@@ -2046,8 +1908,8 @@ class App:
     def start_recording(self):
         try:
             self.stop_preview_level_meter()
-            system_pos = self.system_combo.current()
-            mic_pos = self.mic_combo.current()
+            system_pos = self._option_index(self.system_device_var.get(), self._system_values)
+            mic_pos = self._option_index(self.mic_device_var.get(), self._mic_values)
 
             if system_pos < 0 or not self.system_devices:
                 raise RuntimeError("相手音声デバイスが選択されていません。")
@@ -2071,11 +1933,11 @@ class App:
             self.update_timer()
             self.update_level_meter()
 
-            self.start_btn.config(state="disabled")
-            self.recording_stop_btn.config(state="normal")
-            self.reload_btn.config(state="disabled")
-            self.system_combo.config(state="disabled")
-            self.mic_combo.config(state="disabled")
+            self.start_btn.configure(state="disabled")
+            self.recording_stop_btn.configure(state="normal")
+            self.reload_btn.configure(state="disabled")
+            self.system_combo.configure(state="disabled")
+            self.mic_combo.configure(state="disabled")
 
         except Exception as e:
             write_error_log("App.start_recording error", e)
@@ -2093,7 +1955,7 @@ class App:
     def stop_recording(self):
         try:
             self.status_var.set("録音停止処理中")
-            self.recording_stop_btn.config(state="disabled")
+            self.recording_stop_btn.configure(state="disabled")
 
             if self.timer_job:
                 self.root.after_cancel(self.timer_job)
@@ -2339,7 +2201,7 @@ class App:
             suffix = f" / {pattern_label}" if pattern_label else ""
             self.queue_listbox.insert("end", f"{idx}. {label}{suffix}")
         if hasattr(self, "queue_count_label"):
-            self.queue_count_label.config(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
+            self.queue_count_label.configure(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
 
     def set_transcription_status(self, job_name):
         self.current_transcription_var.set(f"文字起こし: {job_name}")
@@ -2371,29 +2233,22 @@ class App:
 
     def ask_transcription_pattern(self):
         selected_pattern = {"value": None}
-        dialog = tk.Toplevel(self.root)
+        dialog = ctk.CTkToplevel(self.root)
         dialog.title("文字起こしパターン")
         dialog.transient(self.root)
-        dialog.grab_set()
         dialog.resizable(False, False)
+        dialog.configure(fg_color=self.bg_color)
 
-        frame = ttk.Frame(dialog, padding=16)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="この録音の文字起こしパターンを選択してください。").pack(anchor="w", pady=(0, 10))
+        frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=16, pady=16)
+        ctk.CTkLabel(frame, text="この録音の文字起こしパターンを選択してください。",
+                     font=self.font_body, text_color=self.text_color).pack(anchor="w", pady=(0, 10))
 
         label_to_pattern = {label: pattern for pattern, label in TRANSCRIPTION_PATTERNS.items()}
         pattern_var = tk.StringVar(value=TRANSCRIPTION_PATTERNS[DEFAULT_TRANSCRIPTION_PATTERN])
-        pattern_combo = ttk.Combobox(
-            frame,
-            textvariable=pattern_var,
-            values=list(label_to_pattern.keys()),
-            state="readonly",
-            width=38,
-        )
-        pattern_combo.pack(fill="x", pady=(0, 12))
-        pattern_combo.focus_set()
+        self._option_menu(frame, pattern_var, list(label_to_pattern.keys()), None).pack(fill="x", pady=(0, 12))
 
-        button_frame = ttk.Frame(frame)
+        button_frame = ctk.CTkFrame(frame, fg_color="transparent")
         button_frame.pack(fill="x")
 
         def accept():
@@ -2403,11 +2258,14 @@ class App:
         def cancel():
             dialog.destroy()
 
-        ttk.Button(button_frame, text="追加", style="Small.Primary.TButton", command=accept).pack(side="left")
-        ttk.Button(button_frame, text="キャンセル", style="Small.TButton", command=cancel).pack(side="left", padx=(8, 0))
+        self._primary_button(button_frame, "追加", accept, font=self.font_small).pack(side="left")
+        self._ghost_button(button_frame, "キャンセル", cancel, border=self.border_color,
+                          font=self.font_small).pack(side="left", padx=(8, 0))
         dialog.protocol("WM_DELETE_WINDOW", cancel)
         dialog.bind("<Return>", lambda _event: accept())
         dialog.bind("<Escape>", lambda _event: cancel())
+        # CTkToplevel はまれに親の背後に出るため、前面化してから grab する。
+        dialog.after(150, lambda: (dialog.lift(), dialog.focus(), dialog.grab_set()))
         self.root.wait_window(dialog)
         return selected_pattern["value"]
 
@@ -2500,11 +2358,11 @@ class App:
             )
 
     def enable_controls(self):
-        self.start_btn.config(state="normal")
-        self.recording_stop_btn.config(state="normal")
-        self.reload_btn.config(state="normal")
-        self.system_combo.config(state="readonly")
-        self.mic_combo.config(state="readonly")
+        self.start_btn.configure(state="normal")
+        self.recording_stop_btn.configure(state="normal")
+        self.reload_btn.configure(state="normal")
+        self.system_combo.configure(state="normal")
+        self.mic_combo.configure(state="normal")
 
     def schedule_preview_level_meter(self):
         if self.preview_start_job:
@@ -2551,8 +2409,8 @@ class App:
         if self.recorder.is_recording:
             return
 
-        system_pos = self.system_combo.current()
-        mic_pos = self.mic_combo.current()
+        system_pos = self._option_index(self.system_device_var.get(), self._system_values)
+        mic_pos = self._option_index(self.mic_device_var.get(), self._mic_values)
         if system_pos < 0 or mic_pos < 0:
             self.reset_level_meter()
             return
@@ -2668,7 +2526,7 @@ class App:
         self.update_recording_level_values(0, 0)
 
     def update_recording_visual_state(self, is_recording):
-        self.root.configure(bg=self.bg_color)
+        self.root.configure(fg_color=self.bg_color)
         self.root.title(APP_TITLE)
         self.refresh_status_banner()
         self._flash_taskbar_once()
@@ -2685,40 +2543,34 @@ class App:
             self.status_title_var.set("● 録音中")
             self.status_detail_var.set(self.timer_var.get())
         elif "文字起こし中" in status or self.transcription_running:
-            bg = "#fff0f5"
+            bg = self.card_color
             title_fg = self.accent_color
             detail_fg = self.text_color
             self.status_title_var.set("文字起こし中")
             self.status_detail_var.set("録音データを txt に変換しています")
         elif "エラー" in status:
-            bg = "#fff1f2"
-            title_fg = "#be123c"
-            detail_fg = "#be123c"
+            bg = ("#fff1f2", "#3a2326")
+            title_fg = ("#be123c", "#fda4af")
+            detail_fg = ("#be123c", "#fda4af")
             self.status_title_var.set("エラー")
             self.status_detail_var.set("詳細はログを確認してください")
         elif "デバイス" in status:
-            bg = "#ffffff"
+            bg = self.card_color
             title_fg = self.text_color
             detail_fg = self.muted_color
             self.status_title_var.set(status)
             self.status_detail_var.set("録音デバイスの状態を確認しています")
         else:
-            bg = "#ffffff"
+            bg = self.card_color
             title_fg = self.text_color
             detail_fg = self.muted_color
             self.status_title_var.set("停止中")
             self.status_detail_var.set("録音は開始されていません")
 
-        for widget in (
-            self.status_banner,
-            self.status_title_label,
-            self.status_detail_label,
-            self.current_transcription_label,
-        ):
-            widget.configure(bg=bg)
-        self.status_title_label.configure(fg=title_fg)
-        self.status_detail_label.configure(fg=detail_fg)
-        self.current_transcription_label.configure(fg=detail_fg)
+        self.status_banner.configure(fg_color=bg)
+        self.status_title_label.configure(text_color=title_fg)
+        self.status_detail_label.configure(text_color=detail_fg)
+        self.current_transcription_label.configure(text_color=detail_fg)
 
     def _flash_taskbar_once(self):
         if os.name != "nt":
@@ -2889,14 +2741,10 @@ def main():
     ensure_error_log()
     sys.excepthook = global_exception_handler
 
-    root = tk.Tk()
+    ctk.set_appearance_mode("system")
+    ctk.set_default_color_theme("blue")
 
-    style = ttk.Style()
-
-    try:
-        style.theme_use("vista")
-    except Exception:
-        pass
+    root = ctk.CTk()
 
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
