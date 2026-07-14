@@ -3,6 +3,7 @@ import os
 import sys
 import re
 import audioop
+import difflib
 import json
 import struct
 import threading
@@ -31,7 +32,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.04"
+APP_VERSION = "1.06"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,6 +96,9 @@ API_CHUNK_BITRATE_BPS = 64000
 API_CHUNK_SECONDS = int(API_UPLOAD_SAFETY_BYTES * 8 / API_CHUNK_BITRATE_BPS * 0.92)
 API_OVERLAP_SECONDS = 3
 API_KEY_MASK = "******************"
+# 文字起こしAPI/ローカルモデルへ渡す言語ヒント。日本語であることを明示して
+# 英語混入や言語の取り違えを減らす。固有名詞（設定画面入力）と結合して使う。
+API_JAPANESE_PROMPT_HINT = "以下は日本語の会議音声です。"
 
 TRANSCRIPTION_PATTERNS = {
     "online_one_to_one": "オンラインMTG: 自分 + 相手1人",
@@ -857,10 +861,10 @@ class Transcriber:
                 rows = self._transcribe_file_api(audio_path, speaker_label, diarized_prefix=diarized_prefix)
             else:
                 self.preload_model()
-                # 固有名詞ヒントを initial_prompt に渡す。
+                # 言語ヒント + 固有名詞を initial_prompt に渡す。
                 # Whisper の prompt は末尾約224トークンのみ有効なため、
-                # 長すぎる場合は末尾側を優先して安全な長さに丸める。
-                initial_prompt = (self.vocab_prompt or "").strip() or None
+                # 長すぎる場合は末尾側（固有名詞側）を優先して丸める。
+                initial_prompt = self._build_api_prompt() or None
                 if initial_prompt and len(initial_prompt) > 200:
                     initial_prompt = initial_prompt[-200:]
                 segments, info = self.model.transcribe(
@@ -894,6 +898,7 @@ class Transcriber:
             for row in rows:
                 row.setdefault("source", source)
                 row.setdefault("model", self.model_size)
+            self._warn_possible_english(rows, speaker_label)
             self.log(f"文字起こし完了: {speaker_label}")
             return rows
 
@@ -1093,6 +1098,59 @@ class Transcriber:
             if 'temp_path' in locals() and temp_path.exists():
                 temp_path.unlink()
 
+    def _build_api_prompt(self):
+        # 言語ヒント（日本語）+ 固有名詞を結合したプロンプトを作る。
+        # 英語混入・言語の取り違え・固有名詞の誤変換を減らすヒントになる。
+        parts = [API_JAPANESE_PROMPT_HINT]
+        vocab = (getattr(self, "vocab_prompt", "") or "").strip()
+        if vocab:
+            parts.append(vocab)
+        return " ".join(p for p in parts if p).strip()
+
+    def _call_openai_transcription(self, audio_path):
+        # 公式 openai SDK 経由で文字起こしを実行する。
+        # SDK が 429/5xx を Retry-After 付き指数バックオフで自動再試行するため、
+        # 自前のHTTP実装・リトライループは不要になった。
+        api_key = self.resolve_api_key(self.openai_api_key)
+        if not api_key:
+            raise RuntimeError("APIモデル利用時はOpenAI APIキーを入力してください。")
+        try:
+            from openai import OpenAI
+            import openai as openai_mod
+        except Exception as e:
+            raise RuntimeError(
+                "OpenAI APIモデルを使うには openai パッケージが必要です。"
+                "`pip install openai` を実行してください。"
+            ) from e
+
+        client = OpenAI(api_key=api_key, max_retries=5, timeout=600.0)
+        kwargs = {"model": self.model_size, "language": LANGUAGE}
+        prompt = self._build_api_prompt()
+        if prompt:
+            kwargs["prompt"] = prompt
+        if self.model_size == "gpt-4o-transcribe-diarize":
+            kwargs["response_format"] = "diarized_json"
+            kwargs["chunking_strategy"] = "auto"
+        else:
+            kwargs["response_format"] = "json"
+            # 出力のブレを抑えるため温度を 0 にする（diarize は temperature 非対応）。
+            kwargs["temperature"] = 0
+
+        try:
+            with open(audio_path, "rb") as fh:
+                result = client.audio.transcriptions.create(file=fh, **kwargs)
+        except openai_mod.BadRequestError as e:
+            # 「input too large」等はチャンク分割側が文字列で検知するため保持する。
+            raise RuntimeError(str(e)) from e
+        except openai_mod.APIStatusError as e:
+            raise RuntimeError(f"OpenAI APIエラー (HTTP {e.status_code}): {e}") from e
+
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        if isinstance(result, dict):
+            return result
+        return {"text": str(result)}
+
     def _transcribe_api_single(
         self,
         audio_path,
@@ -1101,103 +1159,7 @@ class Transcriber:
         diarized_prefix=None,
         diarized_chunk_index=None,
     ):
-        api_key = self.resolve_api_key(self.openai_api_key)
-        boundary = f"----recordapp{uuid.uuid4().hex}"
-        audio_bytes = audio_path.read_bytes()
-        mime_type = mimetypes.guess_type(str(audio_path))[0] or "application/octet-stream"
-
-        parts = []
-
-        def add_field(name, value):
-            parts.append(f"--{boundary}\r\n".encode("utf-8"))
-            parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-            parts.append(f"{value}\r\n".encode("utf-8"))
-
-        add_field("model", self.model_size)
-        add_field("language", LANGUAGE)
-        if self.model_size == "gpt-4o-transcribe-diarize":
-            add_field("response_format", "diarized_json")
-            add_field("chunking_strategy", "auto")
-        else:
-            add_field("response_format", "json")
-            # 出力のブレを抑えるため温度を明示的に 0 にする。
-            # diarize モデルは temperature 非対応のため送らない。
-            add_field("temperature", "0")
-        # 固有名詞・専門用語のヒント（設定画面で入力）。
-        # 言語判定のブレや固有名詞の誤変換を減らす。
-        vocab_prompt = (getattr(self, "vocab_prompt", "") or "").strip()
-        if vocab_prompt:
-            add_field("prompt", vocab_prompt)
-
-        parts.append(f"--{boundary}\r\n".encode("utf-8"))
-        parts.append(
-            f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode("utf-8")
-        )
-        parts.append(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
-        parts.append(audio_bytes)
-        parts.append(b"\r\n")
-        parts.append(f"--{boundary}--\r\n".encode("utf-8"))
-        body = b"".join(parts)
-
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/audio/transcriptions",
-            data=body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-            },
-        )
-        # 429（レート制限）や 5xx の一時エラーは指数バックオフで再試行する。
-        # system/mic を並列実行すると 429 を踏みやすいため、対応は重要。
-        max_attempts = 5
-        retry_status = {429, 500, 502, 503, 504}
-        last_error = None
-        for attempt in range(max_attempts):
-            try:
-                with urllib.request.urlopen(req, timeout=600) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                break
-            except urllib.error.HTTPError as e:
-                err_body = ""
-                try:
-                    err_body = (e.read() or b"").decode("utf-8", errors="replace")
-                except Exception:
-                    err_body = ""
-                message = f"HTTP {e.code}: {err_body}" if err_body else f"HTTP {e.code}: {e.reason}"
-                if e.code == 400 and "input too large" in err_body.lower():
-                    raise RuntimeError(message)
-                if e.code in retry_status and attempt < max_attempts - 1:
-                    retry_after = None
-                    try:
-                        header_val = e.headers.get("Retry-After") if e.headers else None
-                        if header_val:
-                            retry_after = float(header_val)
-                    except Exception:
-                        retry_after = None
-                    wait_seconds = retry_after if retry_after is not None else min(30, 2 ** attempt)
-                    kind = "レート制限" if e.code == 429 else "API一時エラー"
-                    self.log(
-                        f"{kind}のため再試行します: {attempt + 1}/{max_attempts} "
-                        f"({wait_seconds:.0f}秒待機)"
-                    )
-                    threading.Event().wait(wait_seconds)
-                    continue
-                raise RuntimeError(message)
-            except urllib.error.URLError as e:
-                # タイムアウト・接続エラー等の一時的な失敗はリトライする。
-                last_error = e
-                if attempt >= max_attempts - 1:
-                    raise
-                wait_seconds = min(30, 2 ** attempt)
-                self.log(
-                    f"API接続エラーのため再試行します: {attempt + 1}/{max_attempts} "
-                    f"({wait_seconds}秒待機)"
-                )
-                threading.Event().wait(wait_seconds)
-        else:
-            if last_error:
-                raise last_error
+        payload = self._call_openai_transcription(audio_path)
 
         rows = []
         diarized_speakers = {}
@@ -1241,21 +1203,60 @@ class Transcriber:
     def _normalized_text(text):
         return re.sub(r"\s+", "", (text or "")).strip().lower()
 
+    @staticmethod
+    def _text_similarity(a, b):
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    @staticmethod
+    def _looks_like_english(text):
+        # 日本語文字を1つも含まず、ラテン文字だけがある程度続く行を
+        # 「英語が混入した可能性が高い」とみなす（保守的判定）。
+        t = (text or "").strip()
+        if len(t) < 8:
+            return False
+        latin = sum(1 for ch in t if "a" <= ch.lower() <= "z")
+        jp = sum(1 for ch in t if ("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff"))
+        return jp == 0 and latin >= 8
+
+    def _warn_possible_english(self, rows, speaker_label):
+        # 自動修正はせず、後で見直せるようにログへ警告を出すだけ。
+        for r in rows:
+            if self._looks_like_english(r.get("text", "")):
+                ts = self.fmt(r.get("start", 0.0))
+                snippet = (r.get("text", "") or "")[:40]
+                self.log(f"⚠ 英語が混入している可能性 [{ts}] {speaker_label}: {snippet}")
+
     def _merge_api_chunk_rows(self, existing_rows, chunk_rows):
         if not existing_rows or not chunk_rows:
             return existing_rows + chunk_rows
 
         merged = list(existing_rows)
-        prior_tail = existing_rows[-4:]
+        prior_tail = existing_rows[-6:]
         for row in chunk_rows:
             normalized = self._normalized_text(row.get("text", ""))
             duplicate = False
             if normalized:
+                r_start = float(row.get("start", 0.0))
+                r_end = float(row.get("end", r_start))
                 for old in prior_tail:
-                    same_speaker = old.get("speaker") == row.get("speaker")
-                    near_boundary = abs(float(old.get("start", 0.0)) - float(row.get("start", 0.0))) <= (API_OVERLAP_SECONDS * 2)
-                    duplicate = same_speaker and near_boundary and normalized == self._normalized_text(old.get("text", ""))
-                    if duplicate:
+                    o_start = float(old.get("start", 0.0))
+                    o_end = float(old.get("end", o_start))
+                    # 時間帯が近接/重複している境界付近のみ重複候補とみなす。
+                    near = (r_start <= o_end + API_OVERLAP_SECONDS) and (o_start <= r_end + API_OVERLAP_SECONDS)
+                    if not near:
+                        continue
+                    old_norm = self._normalized_text(old.get("text", ""))
+                    # 完全一致だけでなく、高い類似度や包含関係も重複とみなす。
+                    # APIは同じ区間でも毎回わずかに違う書き起こしを返すため、
+                    # 完全一致のみだと重複が二重に残りやすい。
+                    if old_norm and (
+                        normalized == old_norm
+                        or self._text_similarity(normalized, old_norm) >= 0.82
+                        or (len(normalized) >= 6 and (normalized in old_norm or old_norm in normalized))
+                    ):
+                        duplicate = True
                         break
             if not duplicate:
                 merged.append(row)
