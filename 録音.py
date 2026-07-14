@@ -23,6 +23,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
+from PIL import Image, ImageDraw, ImageTk
 
 import pyaudiowpatch as pyaudio
 from faster_whisper import WhisperModel
@@ -33,7 +34,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.06"
+APP_VERSION = "1.07"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1314,27 +1315,155 @@ class Transcriber:
 # =========================
 # UI
 # =========================
+ASSET_DIR = Path(__file__).resolve().parent
+
+
+def _hex_to_rgb(value):
+    value = value.lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _make_gradient_image(width, height, color_left, color_right, radius, bg_color):
+    width = max(1, int(width))
+    height = max(1, int(height))
+    c1 = _hex_to_rgb(color_left)
+    c2 = _hex_to_rgb(color_right)
+    row = Image.new("RGB", (width, 1))
+    for x in range(width):
+        t = x / max(1, width - 1)
+        row.putpixel((x, 0), (
+            int(c1[0] + (c2[0] - c1[0]) * t),
+            int(c1[1] + (c2[1] - c1[1]) * t),
+            int(c1[2] + (c2[2] - c1[2]) * t),
+        ))
+    grad = row.resize((width, height))
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
+    out = Image.new("RGB", (width, height), _hex_to_rgb(bg_color))
+    out.paste(grad, (0, 0), mask)
+    return out
+
+
+class GradientButton(tk.Canvas):
+    """PIL でグラデーションを描いた角丸ボタン（CustomTkinter はグラデ非対応のため自作）。"""
+
+    def __init__(self, parent, text="", command=None, width=200, height=48,
+                 colors=("#3a5bf0", "#7b45f5"), hover_colors=("#4f6dff", "#9160ff"),
+                 disabled_colors=("#2a2d40", "#2a2d40"), radius=16,
+                 font=("Yu Gothic UI", 15, "bold"), text_color="#ffffff",
+                 disabled_text="#6b7086", bg="#0b0c14"):
+        super().__init__(parent, width=width, height=height, highlightthickness=0, bd=0, bg=bg)
+        self._text = text
+        self._command = command
+        self._colors = colors
+        self._hover = hover_colors
+        self._disabled = disabled_colors
+        self._radius = radius
+        self._font = font
+        self._text_color = text_color
+        self._disabled_text = disabled_text
+        self._state = "normal"
+        self._hovering = False
+        self._photo = None
+        self.bind("<Configure>", lambda _e: self._render())
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+
+    def _colors_now(self):
+        if self._state == "disabled":
+            return self._disabled
+        return self._hover if self._hovering else self._colors
+
+    def _render(self):
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        c1, c2 = self._colors_now()
+        img = _make_gradient_image(w, h, c1, c2, self._radius, self["bg"])
+        self._photo = ImageTk.PhotoImage(img)
+        self.delete("all")
+        self.create_image(0, 0, anchor="nw", image=self._photo)
+        fill = self._text_color if self._state == "normal" else self._disabled_text
+        self.create_text(w // 2, h // 2, text=self._text, fill=fill, font=self._font)
+
+    def _on_click(self, _e):
+        if self._state == "normal" and self._command:
+            self._command()
+
+    def _on_enter(self, _e):
+        if self._state == "normal":
+            self._hovering = True
+            super().configure(cursor="hand2")
+            self._render()
+
+    def _on_leave(self, _e):
+        self._hovering = False
+        self._render()
+
+    def configure(self, **kwargs):
+        rerender = False
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            rerender = True
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+            rerender = True
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if kwargs:
+            super().configure(**kwargs)
+        if rerender:
+            self._render()
+
+    config = configure
+
+
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("460x580")
-        self.root.minsize(430, 540)
+        self.root.geometry("470x600")
+        self.root.minsize(440, 560)
+        try:
+            _ico = ASSET_DIR / "icon.ico"
+            if _ico.exists():
+                self.root.iconbitmap(default=str(_ico))
+        except Exception:
+            pass
 
-        # 配色。(light, dark) タプルはライト/ダーク両モードに自動対応する。
-        self.accent_color = "#ff5c8a"
-        self.accent_hover = "#ff3d73"
-        self.accent_soft = "#ffe7ef"
-        self.text_color = ("#1f2937", "#e8e8ea")
-        self.muted_color = ("#6b7280", "#9aa0a6")
-        self.card_color = ("#ffffff", "#2b2b2d")
-        self.bg_color = ("#fff8fb", "#1b1b1d")
-        self.border_color = ("#f4d9e2", "#3a3a3d")
+        # 配色（モックアップに合わせたダークネイビー + ブルー〜パープル）
+        self.bg_color = "#0b0c14"
+        self.bg_hex = "#0b0c14"
+        self.card_color = "#141621"
+        self.border_color = "#272b3d"
+        self.accent_color = "#5566f5"
+        self.accent_hover = "#4353e8"
+        self.accent_soft = "#20233a"
+        self.text_color = "#eef0f8"
+        self.muted_color = "#8b90ab"
+        self.purple = "#8b5cf6"
+        self.diamond = "#6b7bff"
+        self.grad_left = "#3a5bf0"
+        self.grad_right = "#7b45f5"
+        self.grad_left_h = "#4f6dff"
+        self.grad_right_h = "#9160ff"
 
         self.font_body = ("Yu Gothic UI", 13)
         self.font_small = ("Yu Gothic UI", 12)
-        self.font_section = ("Yu Gothic UI", 14, "bold")
-        self.font_title = ("Yu Gothic UI", 20, "bold")
+        self.font_section = ("Yu Gothic UI", 15, "bold")
+        self.font_title = ("Yu Gothic UI", 22, "bold")
+        self.font_status = ("Yu Gothic UI", 26, "bold")
+
+        self.logo_image = None
+        try:
+            _logo = ASSET_DIR / "logo.png"
+            if _logo.exists():
+                _img = Image.open(_logo)
+                self.logo_image = ctk.CTkImage(light_image=_img, dark_image=_img, size=(58, 58))
+        except Exception:
+            self.logo_image = None
 
         self.root.configure(fg_color=self.bg_color)
 
@@ -1402,41 +1531,55 @@ class App:
 
     def _card(self, parent):
         return ctk.CTkFrame(
-            parent,
-            fg_color=self.card_color,
-            corner_radius=14,
-            border_width=1,
-            border_color=self.border_color,
+            parent, fg_color=self.card_color, corner_radius=16,
+            border_width=1, border_color=self.border_color,
         )
 
-    def _primary_button(self, parent, text, command, **kwargs):
-        return ctk.CTkButton(
-            parent, text=text, command=command,
-            fg_color=self.accent_color, hover_color=self.accent_hover, **kwargs
+    def _gradient_button(self, parent, text, command, height=48, width=200,
+                         font=("Yu Gothic UI", 15, "bold"), radius=16):
+        return GradientButton(
+            parent, text=text, command=command, height=height, width=width,
+            font=font, radius=radius, bg=self.bg_hex,
+            colors=(self.grad_left, self.grad_right),
+            hover_colors=(self.grad_left_h, self.grad_right_h),
         )
 
-    def _ghost_button(self, parent, text, command, border=None, **kwargs):
+    def _ghost_button(self, parent, text, command, border=None, text_color=None, **kwargs):
         return ctk.CTkButton(
-            parent, text=text, command=command,
-            fg_color="transparent", text_color=self.accent_color,
-            hover_color=self.accent_soft, border_width=1,
-            border_color=border or self.accent_color, **kwargs
+            parent, text=text, command=command, fg_color="transparent",
+            text_color=text_color or self.accent_color, hover_color=self.accent_soft,
+            border_width=1, border_color=border or self.accent_color,
+            corner_radius=10, **kwargs
         )
 
     def _option_menu(self, parent, variable, values, command):
         return ctk.CTkOptionMenu(
             parent, variable=variable, values=values, command=command,
-            fg_color=self.accent_color, button_color=self.accent_color,
-            button_hover_color=self.accent_hover, font=self.font_small,
-            dynamic_resizing=False,
+            fg_color="#1b1e2e", button_color=self.accent_color,
+            button_hover_color=self.accent_hover, text_color=self.text_color,
+            dropdown_fg_color=self.card_color, dropdown_hover_color=self.accent_color,
+            dropdown_text_color=self.text_color, corner_radius=10, height=40,
+            font=self.font_small,
         )
+
+    def _section_header(self, parent, text):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(row, text="◆", font=("Yu Gothic UI", 12),
+                     text_color=self.diamond).pack(side="left")
+        ctk.CTkLabel(row, text=text, font=self.font_section,
+                     text_color=self.text_color).pack(side="left", padx=(8, 0))
+        return row
 
     def build_ui(self):
         self.tabview = ctk.CTkTabview(
             self.root,
             fg_color=self.bg_color,
+            segmented_button_fg_color=self.card_color,
             segmented_button_selected_color=self.accent_color,
             segmented_button_selected_hover_color=self.accent_hover,
+            segmented_button_unselected_color=self.card_color,
+            text_color=self.text_color,
+            corner_radius=12,
         )
         self.tabview.pack(fill="both", expand=True, padx=14, pady=(6, 14))
 
@@ -1446,149 +1589,164 @@ class App:
 
         # ---- ホーム ----
         self.status_banner = ctk.CTkFrame(
-            home_tab, fg_color=self.card_color, corner_radius=14,
+            home_tab, fg_color=self.card_color, corner_radius=16,
             border_width=1, border_color=self.border_color,
         )
         self.status_banner.pack(fill="x", pady=(4, 12))
+        badge = ctk.CTkFrame(self.status_banner, fg_color=self.accent_soft,
+                             corner_radius=18, width=88, height=88)
+        badge.pack(side="left", padx=16, pady=16)
+        badge.pack_propagate(False)
+        if self.logo_image is not None:
+            ctk.CTkLabel(badge, text="", image=self.logo_image).pack(expand=True)
+        else:
+            ctk.CTkLabel(badge, text="◆", font=("Yu Gothic UI", 36),
+                         text_color=self.accent_color).pack(expand=True)
+        text_col = ctk.CTkFrame(self.status_banner, fg_color="transparent")
+        text_col.pack(side="left", fill="both", expand=True, padx=(4, 16), pady=16)
         self.status_title_label = ctk.CTkLabel(
-            self.status_banner, textvariable=self.status_title_var,
-            font=self.font_title, text_color=self.text_color, anchor="w",
-            fg_color="transparent",
-        )
-        self.status_title_label.pack(fill="x", padx=16, pady=(12, 2))
+            text_col, textvariable=self.status_title_var, font=self.font_status,
+            text_color=self.text_color, anchor="w")
+        self.status_title_label.pack(fill="x")
         self.status_detail_label = ctk.CTkLabel(
-            self.status_banner, textvariable=self.status_detail_var,
-            font=self.font_body, text_color=self.muted_color, anchor="w",
-            fg_color="transparent",
-        )
-        self.status_detail_label.pack(fill="x", padx=16, pady=(0, 2))
+            text_col, textvariable=self.status_detail_var, font=self.font_body,
+            text_color=self.muted_color, anchor="w")
+        self.status_detail_label.pack(fill="x", pady=(2, 0))
         self.current_transcription_label = ctk.CTkLabel(
-            self.status_banner, textvariable=self.current_transcription_var,
-            font=self.font_small, text_color=self.muted_color, anchor="w",
-            fg_color="transparent",
-        )
-        self.current_transcription_label.pack(fill="x", padx=16, pady=(0, 12))
+            text_col, textvariable=self.current_transcription_var, font=self.font_small,
+            text_color=self.accent_color, anchor="w")
+        self.current_transcription_label.pack(fill="x", pady=(8, 0))
         self.refresh_status_banner()
 
         device_card = self._card(home_tab)
-        device_card.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(device_card, text="🎙  録音デバイス選択", font=self.font_section,
-                     text_color=self.text_color, anchor="w").pack(fill="x", padx=14, pady=(12, 8))
+        device_card.pack(fill="x", pady=(0, 12))
+        self._section_header(device_card, "録音デバイス選択").pack(fill="x", padx=16, pady=(14, 10))
         ctk.CTkLabel(device_card, text="スピーカー / 相手音声", font=self.font_small,
-                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=14)
+                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=16)
         self.system_combo = self._option_menu(device_card, self.system_device_var,
                                                ["(読み込み中)"], self.on_device_changed)
-        self.system_combo.pack(fill="x", padx=14, pady=(4, 10))
+        self.system_combo.pack(fill="x", padx=16, pady=(4, 12))
         ctk.CTkLabel(device_card, text="マイク / 自分の声", font=self.font_small,
-                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=14)
+                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=16)
         self.mic_combo = self._option_menu(device_card, self.mic_device_var,
                                             ["(読み込み中)"], self.on_device_changed)
-        self.mic_combo.pack(fill="x", padx=14, pady=(4, 10))
+        self.mic_combo.pack(fill="x", padx=16, pady=(4, 12))
         self.reload_btn = self._ghost_button(device_card, "⟳  デバイス再読み込み",
-                                             self.load_devices, font=self.font_small, height=32)
-        self.reload_btn.pack(anchor="e", padx=14, pady=(2, 12))
+                                             self.load_devices, font=self.font_small, height=34)
+        self.reload_btn.pack(anchor="e", padx=16, pady=(2, 14))
 
-        self.start_btn = self._primary_button(home_tab, "●  録音開始", self.start_recording,
-                                              font=("Yu Gothic UI", 15, "bold"), height=46)
+        self.start_btn = self._gradient_button(home_tab, "●  録音開始", self.start_recording,
+                                               height=52, font=("Yu Gothic UI", 16, "bold"))
+        self.start_btn.pack(fill="x", pady=(2, 4))
         self.start_btn.configure(state="disabled")
-        self.start_btn.pack(fill="x", pady=(2, 6))
 
         self.build_recording_view()
 
         # ---- 分析 ----
         analysis_top = ctk.CTkFrame(analysis_tab, fg_color="transparent")
-        analysis_top.pack(fill="x", pady=(8, 10))
-        self.start_transcribe_btn = self._primary_button(analysis_top, "✐  文字起こし開始",
-                                                         self.start_transcription_queue,
-                                                         font=self.font_body, height=38)
+        analysis_top.pack(fill="x", pady=(8, 12))
+        self.start_transcribe_btn = self._gradient_button(
+            analysis_top, "✐  文字起こし開始", self.start_transcription_queue,
+            height=44, width=220, font=self.font_section)
         self.start_transcribe_btn.pack(side="left")
         self.open_folder_btn = self._ghost_button(analysis_top, "🗀  録音フォルダを開く",
-                                                  self.open_output_folder, font=self.font_small, height=32)
+                                                  self.open_output_folder, font=self.font_small, height=34)
         self.open_folder_btn.pack(side="left", padx=(10, 0))
 
-        self.queue_count_label = ctk.CTkLabel(analysis_tab, text="追加済みファイル（0 件）",
-                                              font=self.font_section, text_color=self.text_color, anchor="w")
-        self.queue_count_label.pack(anchor="w", padx=4, pady=(0, 6))
+        count_row = ctk.CTkFrame(analysis_tab, fg_color="transparent")
+        count_row.pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkLabel(count_row, text="◆", font=("Yu Gothic UI", 12),
+                     text_color=self.diamond).pack(side="left")
+        self.queue_count_label = ctk.CTkLabel(count_row, text="追加済みファイル（0 件）",
+                                              font=self.font_section, text_color=self.text_color)
+        self.queue_count_label.pack(side="left", padx=(8, 0))
 
         list_card = self._card(analysis_tab)
-        list_card.pack(fill="both", expand=True, pady=(0, 8))
+        list_card.pack(fill="both", expand=True, pady=(0, 10))
+        self.queue_placeholder = ctk.CTkFrame(list_card, fg_color="transparent")
+        ctk.CTkLabel(self.queue_placeholder, text="🗀", font=("Yu Gothic UI", 46),
+                     text_color=self.muted_color).pack(pady=(46, 10))
+        ctk.CTkLabel(self.queue_placeholder, text="追加されたファイルはここに表示されます",
+                     font=self.font_body, text_color=self.text_color).pack()
+        ctk.CTkLabel(self.queue_placeholder, text="フォルダや動画を追加して、文字起こしを開始しましょう",
+                     font=self.font_small, text_color=self.muted_color).pack(pady=(6, 46))
         self.queue_listbox = tk.Listbox(
             list_card, height=8, relief="flat", borderwidth=0, highlightthickness=0,
-            bg=self._mode_color("#ffffff", "#2b2b2d"),
-            fg=self._mode_color("#1f2937", "#e8e8ea"),
-            selectbackground=self.accent_soft, selectforeground="#1f2937",
-            font=("Yu Gothic UI", 12),
+            bg=self.card_color, fg=self.text_color,
+            selectbackground=self.accent_color, selectforeground="#ffffff",
+            font=("Yu Gothic UI", 12), activestyle="none",
         )
-        self.queue_listbox.pack(fill="both", expand=True, padx=12, pady=12)
+        self.queue_placeholder.pack(fill="both", expand=True, padx=12, pady=12)
 
         queue_btn_frame = ctk.CTkFrame(analysis_tab, fg_color="transparent")
         queue_btn_frame.pack(fill="x", pady=(0, 12))
-        self._primary_button(queue_btn_frame, "＋ フォルダ追加", self.add_queue_from_dialog,
-                             font=self.font_small, width=120).pack(side="left")
-        self._primary_button(queue_btn_frame, "▶ 動画追加", self.add_video_queue_from_dialog,
-                             font=self.font_small, width=110).pack(side="left", padx=(8, 0))
+        self._ghost_button(queue_btn_frame, "＋ フォルダ追加", self.add_queue_from_dialog,
+                           font=self.font_small, height=36, width=118).pack(side="left")
+        self._ghost_button(queue_btn_frame, "▶ 動画追加", self.add_video_queue_from_dialog,
+                           font=self.font_small, height=36, width=108).pack(side="left", padx=(8, 0))
         self._ghost_button(queue_btn_frame, "🗑 選択削除", self.remove_selected_queue,
-                          font=self.font_small, width=110).pack(side="left", padx=(8, 0))
+                           border=self.purple, text_color=self.purple,
+                           font=self.font_small, height=36, width=108).pack(side="left", padx=(8, 0))
 
         # ---- 設定 ----
         settings_top = ctk.CTkFrame(settings_tab, fg_color="transparent")
-        settings_top.pack(fill="x", pady=(8, 10))
+        settings_top.pack(fill="x", pady=(8, 12))
         self.open_error_btn = self._ghost_button(settings_top, "▤  エラーログを開く",
-                                                 self.open_error_log, font=self.font_small, height=32)
+                                                 self.open_error_log, font=self.font_small, height=34)
         self.open_error_btn.pack(side="left")
         settings_right = ctk.CTkFrame(settings_top, fg_color="transparent")
         settings_right.pack(side="right")
         ctk.CTkLabel(settings_right, text=f"v{APP_VERSION}", font=self.font_small,
                      text_color=self.muted_color).pack(anchor="e")
-        self._ghost_button(settings_right, "アプリ説明", self.show_app_description,
-                          border=self.border_color, font=self.font_small,
-                          width=90, height=28).pack(anchor="e", pady=(4, 0))
+        self._ghost_button(settings_right, "ⓘ アプリ説明", self.show_app_description,
+                           border=self.border_color, text_color=self.muted_color,
+                           font=self.font_small, width=110, height=30).pack(anchor="e", pady=(6, 0))
 
         settings_card = self._card(settings_tab)
         settings_card.pack(fill="x", pady=(0, 12))
+        self._section_header(settings_card, "文字起こし設定").pack(fill="x", padx=16, pady=(14, 6))
         settings_frame = ctk.CTkFrame(settings_card, fg_color="transparent")
-        settings_frame.pack(fill="x", padx=14, pady=14)
-        ctk.CTkLabel(settings_frame, text="文字起こし設定", font=self.font_section,
-                     text_color=self.text_color, anchor="w").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        settings_frame.pack(fill="x", padx=16, pady=(0, 14))
         ctk.CTkLabel(settings_frame, text="モデル", font=self.font_body,
-                     text_color=self.text_color).grid(row=1, column=0, sticky="w", pady=4)
+                     text_color=self.text_color).grid(row=0, column=0, sticky="w", pady=6)
         self.model_combo = self._option_menu(settings_frame, self.model_var,
                                               list(MODEL_CHOICES.values()), self.on_transcription_setting_changed)
-        self.model_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=4)
+        self.model_combo.grid(row=0, column=1, sticky="ew", padx=(12, 0), pady=6)
         ctk.CTkLabel(settings_frame, text="処理モード", font=self.font_body,
-                     text_color=self.text_color).grid(row=2, column=0, sticky="w", pady=4)
+                     text_color=self.text_color).grid(row=1, column=0, sticky="w", pady=6)
         self.mode_combo = self._option_menu(settings_frame, self.mode_var,
                                              list(MODE_CHOICES.keys()), self.on_transcription_setting_changed)
-        self.mode_combo.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=4)
+        self.mode_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=6)
         ctk.CTkLabel(settings_frame, text="OpenAI APIキー", font=self.font_body,
-                     text_color=self.text_color).grid(row=3, column=0, sticky="w", pady=4)
+                     text_color=self.text_color).grid(row=2, column=0, sticky="w", pady=6)
         self.api_key_entry = ctk.CTkEntry(settings_frame, textvariable=self.api_key_var,
-                                           show="*", font=self.font_small)
-        self.api_key_entry.grid(row=3, column=1, sticky="ew", padx=(12, 0), pady=4)
+                                           show="*", font=self.font_small, height=38,
+                                           fg_color="#1b1e2e", border_color=self.border_color)
+        self.api_key_entry.grid(row=2, column=1, sticky="ew", padx=(12, 0), pady=6)
         self.api_key_entry.bind("<FocusOut>", self.on_transcription_setting_changed)
         self.api_key_note_var = tk.StringVar()
         self.api_key_note_label = ctk.CTkLabel(settings_frame, textvariable=self.api_key_note_var,
                                                font=self.font_small, text_color=self.muted_color,
                                                wraplength=360, justify="left", anchor="w")
-        self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        self.api_key_note_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         ctk.CTkLabel(settings_frame, text="固有名詞・専門用語", font=self.font_body,
-                     text_color=self.text_color).grid(row=5, column=0, sticky="nw", pady=4)
+                     text_color=self.text_color).grid(row=4, column=0, sticky="nw", pady=6)
         self.vocab_prompt_entry = ctk.CTkEntry(settings_frame, textvariable=self.vocab_prompt_var,
-                                               font=self.font_small)
-        self.vocab_prompt_entry.grid(row=5, column=1, sticky="ew", padx=(12, 0), pady=4)
+                                               font=self.font_small, height=38,
+                                               fg_color="#1b1e2e", border_color=self.border_color)
+        self.vocab_prompt_entry.grid(row=4, column=1, sticky="ew", padx=(12, 0), pady=6)
         self.vocab_prompt_entry.bind("<FocusOut>", self.on_transcription_setting_changed)
         ctk.CTkLabel(settings_frame,
                      text="会議でよく出る固有名詞・専門用語をカンマ区切りで入力すると、"
                           "文字起こしの誤変換や言語の取り違えを減らせます"
                           "（例: 伴走型DX相談, IPA, 西端, ハピネス社）。",
                      font=self.font_small, text_color=self.muted_color, wraplength=360,
-                     justify="left", anchor="w").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+                     justify="left", anchor="w").grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 4))
         settings_frame.columnconfigure(1, weight=1)
         self.refresh_api_key_entry_state()
         self.refresh_settings_summary()
 
-        ctk.CTkLabel(settings_tab, text="ログ", font=self.font_section,
-                     text_color=self.text_color, anchor="w").pack(anchor="w", padx=4, pady=(0, 6))
+        self._section_header(settings_tab, "ログ").pack(anchor="w", padx=4, pady=(0, 6))
         log_card = self._card(settings_tab)
         log_card.pack(fill="both", expand=True)
         self.log_text = ctk.CTkTextbox(log_card, wrap="word", font=("Yu Gothic UI", 12),
@@ -1607,9 +1765,9 @@ class App:
     def build_recording_view(self):
         self.recording_frame = ctk.CTkFrame(self.root, fg_color=self.bg_color)
 
-        self.recording_stop_btn = self._primary_button(self.recording_frame, "■  停止",
-                                                       self.stop_recording,
-                                                       font=("Yu Gothic UI", 15, "bold"), height=46)
+        self.recording_stop_btn = self._gradient_button(self.recording_frame, "■  停止",
+                                                        self.stop_recording,
+                                                        font=("Yu Gothic UI", 16, "bold"), height=52)
         self.recording_stop_btn.pack(fill="x", pady=(0, 12))
 
         levels_frame = ctk.CTkFrame(self.recording_frame, fg_color="transparent")
@@ -2202,6 +2360,13 @@ class App:
             self.queue_listbox.insert("end", f"{idx}. {label}{suffix}")
         if hasattr(self, "queue_count_label"):
             self.queue_count_label.configure(text=f"追加済みファイル（{len(self.transcription_queue)} 件）")
+        if hasattr(self, "queue_placeholder"):
+            if self.transcription_queue:
+                self.queue_placeholder.pack_forget()
+                self.queue_listbox.pack(fill="both", expand=True, padx=12, pady=12)
+            else:
+                self.queue_listbox.pack_forget()
+                self.queue_placeholder.pack(fill="both", expand=True, padx=12, pady=12)
 
     def set_transcription_status(self, job_name):
         self.current_transcription_var.set(f"文字起こし: {job_name}")
@@ -2537,40 +2702,35 @@ class App:
 
         status = self.status_var.get()
         if "録音中" in status:
-            bg = self.accent_color
-            title_fg = "#ffffff"
-            detail_fg = "#ffffff"
+            title_fg = self.accent_color
+            detail_fg = self.text_color
             self.status_title_var.set("● 録音中")
             self.status_detail_var.set(self.timer_var.get())
         elif "文字起こし中" in status or self.transcription_running:
-            bg = self.card_color
             title_fg = self.accent_color
-            detail_fg = self.text_color
+            detail_fg = self.muted_color
             self.status_title_var.set("文字起こし中")
             self.status_detail_var.set("録音データを txt に変換しています")
         elif "エラー" in status:
-            bg = ("#fff1f2", "#3a2326")
-            title_fg = ("#be123c", "#fda4af")
-            detail_fg = ("#be123c", "#fda4af")
+            title_fg = "#fb7185"
+            detail_fg = "#fb7185"
             self.status_title_var.set("エラー")
             self.status_detail_var.set("詳細はログを確認してください")
         elif "デバイス" in status:
-            bg = self.card_color
             title_fg = self.text_color
             detail_fg = self.muted_color
             self.status_title_var.set(status)
             self.status_detail_var.set("録音デバイスの状態を確認しています")
         else:
-            bg = self.card_color
             title_fg = self.text_color
             detail_fg = self.muted_color
             self.status_title_var.set("停止中")
             self.status_detail_var.set("録音は開始されていません")
 
-        self.status_banner.configure(fg_color=bg)
         self.status_title_label.configure(text_color=title_fg)
         self.status_detail_label.configure(text_color=detail_fg)
-        self.current_transcription_label.configure(text_color=detail_fg)
+        self.current_transcription_label.configure(
+            text_color=(self.accent_color if "待機" not in self.current_transcription_var.get() else self.muted_color))
 
     def _flash_taskbar_once(self):
         if os.name != "nt":
@@ -2741,7 +2901,7 @@ def main():
     ensure_error_log()
     sys.excepthook = global_exception_handler
 
-    ctk.set_appearance_mode("system")
+    ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
 
     root = ctk.CTk()
