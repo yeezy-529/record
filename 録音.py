@@ -28,13 +28,34 @@ from PIL import Image, ImageDraw, ImageTk
 import pyaudiowpatch as pyaudio
 from faster_whisper import WhisperModel
 
+# --- ノイズ除去（任意）: 未インストールでも起動できるようにフラグで分岐する ---
+try:
+    import numpy as np
+except Exception:
+    np = None
+try:
+    import noisereduce as nr
+except Exception:
+    nr = None
+NOISEREDUCE_AVAILABLE = nr is not None and np is not None
+
+# --- OSマイクミュート連携（任意・Windows/pycaw）: 未インストールでも起動できるようにする ---
+try:
+    import comtypes
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from pycaw.constants import EDataFlow
+    from comtypes import CLSCTX_ALL
+    PYCAW_AVAILABLE = True
+except Exception:
+    PYCAW_AVAILABLE = False
+
 
 # =========================
 # 設定
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.07"
+APP_VERSION = "1.08"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -44,6 +65,9 @@ ERROR_LOG = BASE_DIR / "error_log.txt"
 FORMAT = pyaudio.paInt16
 CHUNK = 2048
 LANGUAGE = "ja"
+
+NOISE_GATE_PERCENT = 5  # これ未満の音量(%)は無音として扱う（暗騒音カット）
+MIC_MUTE_POLL_INTERVAL_SEC = 0.4  # OS側マイクミュート状態を確認する間隔(秒)
 
 MODEL_SIZE = "large-v3"
 COMPUTE_TYPE = "int8"
@@ -81,6 +105,7 @@ DEFAULT_SETTINGS = {
     "compute_type": COMPUTE_TYPE,
     "openai_api_key": "",
     "vocab_prompt": "",
+    "noise_reduction": False,
 }
 
 API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-4o-transcribe-diarize"}
@@ -214,6 +239,13 @@ class AudioRecorder:
         self.mixed_wav = None
         self.mixed_compressed = None
         self.txt_out = None
+
+        # ミュート・ノイズ関連
+        self.mic_muted_by_os = False       # OS側マイクミュートと同期した状態（自動）
+        self.system_muted_by_user = False  # UIからのスピーカー（相手音声）録音ミュート（手動）
+        self.noise_reduction_enabled = False
+        self._mic_mute_poll_running = False
+        self._mic_mute_poll_thread = None
 
     @staticmethod
     def _device_name_lower(device):
@@ -458,8 +490,12 @@ class AudioRecorder:
             self.system_thread.start()
             self.mic_thread.start()
 
+            self._start_mic_mute_watch(self.mic_device.get("name", ""))
+
             self.log(f"録音保存先: {self.output_dir}")
             self.log("録音を開始しました。")
+            if not PYCAW_AVAILABLE:
+                self.log("pycawが利用できないため、OSマイクミュートとの同期は無効です。")
 
         except Exception as e:
             write_error_log("AudioRecorder.start error", e)
@@ -516,11 +552,13 @@ class AudioRecorder:
         write_error_log(f"{label} open failed all candidates", last_error)
         raise RuntimeError(f"{label} の録音開始に失敗しました: {last_error}")
 
-    def _capture_loop(self, stream, level_attr, frame_attr, log_title, log_message):
+    def _capture_loop(self, stream, level_attr, frame_attr, log_title, log_message, kind):
         while self.is_recording:
             try:
                 data = stream.read(CHUNK, exception_on_overflow=False)
-                setattr(self, level_attr, self._calc_level(data))
+                level = self._calc_level(data)
+                data, level = self._apply_mute_and_gate(kind, data, level)
+                setattr(self, level_attr, level)
 
                 with self.frame_lock:
                     getattr(self, frame_attr).append(data)
@@ -531,6 +569,20 @@ class AudioRecorder:
                 self.is_recording = False
                 break
 
+    def _apply_mute_and_gate(self, kind, data, level):
+        # OS側マイクミュート（自動）・UIからのスピーカーミュート（手動）・
+        # 5%未満の暗騒音カット（常時）を反映し、対象なら無音データに置き換える。
+        muted = False
+        if kind == "mic" and self.mic_muted_by_os:
+            muted = True
+        elif kind == "system" and self.system_muted_by_user:
+            muted = True
+        if not muted and level < NOISE_GATE_PERCENT:
+            muted = True
+        if muted:
+            return b"\x00" * len(data), 0
+        return data, level
+
     def _system_loop(self):
         self._capture_loop(
             stream=self.system_stream,
@@ -538,6 +590,7 @@ class AudioRecorder:
             frame_attr="system_frames",
             log_title="AudioRecorder._system_loop error",
             log_message="相手音声読み取りエラー",
+            kind="system",
         )
 
     def _mic_loop(self):
@@ -547,13 +600,80 @@ class AudioRecorder:
             frame_attr="mic_frames",
             log_title="AudioRecorder._mic_loop error",
             log_message="マイク読み取りエラー",
+            kind="mic",
         )
+
+    def set_system_muted(self, muted):
+        self.system_muted_by_user = bool(muted)
+
+    def set_noise_reduction(self, enabled):
+        self.noise_reduction_enabled = bool(enabled)
+
+    def _start_mic_mute_watch(self, device_name):
+        self._stop_mic_mute_watch()
+        if not PYCAW_AVAILABLE:
+            return
+        self._mic_mute_poll_running = True
+        self._mic_mute_poll_thread = threading.Thread(
+            target=self._mic_mute_poll_loop, args=(device_name,), daemon=True
+        )
+        self._mic_mute_poll_thread.start()
+
+    def _stop_mic_mute_watch(self):
+        self._mic_mute_poll_running = False
+        if self._mic_mute_poll_thread:
+            self._mic_mute_poll_thread.join(timeout=1)
+            self._mic_mute_poll_thread = None
+        self.mic_muted_by_os = False
+
+    def _mic_mute_poll_loop(self, device_name):
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        try:
+            while self._mic_mute_poll_running:
+                muted = self._query_capture_mute(device_name)
+                if muted is not None:
+                    self.mic_muted_by_os = muted
+                time.sleep(MIC_MUTE_POLL_INTERVAL_SEC)
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _query_capture_mute(device_name):
+        # pyaudiowpatch(WASAPI)のマイク名とWindows Core Audioのエンドポイント名を
+        # 部分一致でマッチングし、そのエンドポイントのミュート状態を返す。
+        # 一致しない/エラー時はNone（呼び出し側は既存の状態を維持する）。
+        if not PYCAW_AVAILABLE or not device_name:
+            return None
+        target = str(device_name).strip().lower()
+        try:
+            enumerator = AudioUtilities.GetDeviceEnumerator()
+            collection = enumerator.EnumAudioEndpoints(EDataFlow.eCapture.value, 1)
+            for i in range(collection.GetCount()):
+                dev = collection.Item(i)
+                try:
+                    friendly = (AudioUtilities.CreateDevice(dev).FriendlyName or "").strip().lower()
+                except Exception:
+                    friendly = ""
+                if friendly and (friendly in target or target in friendly):
+                    iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                    vol = iface.QueryInterface(IAudioEndpointVolume)
+                    return bool(vol.GetMute())
+        except Exception as e:
+            write_error_log("AudioRecorder._query_capture_mute error", e)
+        return None
 
     def stop(self):
         if not self.is_recording and not self.p:
             return None
 
         self.is_recording = False
+        self._stop_mic_mute_watch()
 
         # キャプチャスレッドの stream.read() はブロッキング呼び出し。
         # デバイス切断などで read() が返らないまま別スレッドから stream.close()
@@ -575,6 +695,15 @@ class AudioRecorder:
                 with self.frame_lock:
                     system_frames = list(self.system_frames)
                     mic_frames = list(self.mic_frames)
+
+                if system_frames and self.noise_reduction_enabled:
+                    system_frames = self._maybe_reduce_noise(
+                        system_frames, self.system_channels, self.system_rate, "相手音声"
+                    )
+                if mic_frames and self.noise_reduction_enabled:
+                    mic_frames = self._maybe_reduce_noise(
+                        mic_frames, self.mic_channels, self.mic_rate, "マイク"
+                    )
 
                 if system_frames:
                     self._save_wav(
@@ -702,6 +831,35 @@ class AudioRecorder:
 
         except Exception:
             return 0
+
+    def _maybe_reduce_noise(self, frames, channels, rate, label):
+        if not NOISEREDUCE_AVAILABLE:
+            self.log(f"{label}: noisereduceが利用できないためノイズ除去をスキップしました。")
+            return frames
+        try:
+            pcm = b"".join(frames)
+            min_bytes = rate * 2 * max(1, channels)
+            if len(pcm) < min_bytes:
+                # 1秒未満はノイズプロファイルの推定に不十分なためスキップする。
+                return frames
+            arr = np.frombuffer(pcm, dtype=np.int16)
+            if channels > 1:
+                arr = arr.reshape(-1, channels)
+                reduced_cols = [
+                    nr.reduce_noise(y=arr[:, c], sr=rate, stationary=True, prop_decrease=0.85)
+                    for c in range(channels)
+                ]
+                reduced = np.stack(reduced_cols, axis=1).reshape(-1).astype(np.int16)
+            else:
+                reduced = nr.reduce_noise(
+                    y=arr, sr=rate, stationary=True, prop_decrease=0.85
+                ).astype(np.int16)
+            self.log(f"{label}: ノイズ除去を適用しました。")
+            return [reduced.tobytes()]
+        except Exception as e:
+            write_error_log(f"AudioRecorder._maybe_reduce_noise error: {label}", e)
+            self.log(f"{label}: ノイズ除去に失敗しました（元の音声のまま保存します）: {e}")
+            return frames
 
     def _save_wav(self, path, frames, channels, rate):
         p = pyaudio.PyAudio()
@@ -1473,6 +1631,7 @@ class App:
         self.transcriber = Transcriber(self.add_log)
         self.app_settings = DEFAULT_SETTINGS.copy()
         self.transcriber.set_settings(self.app_settings)
+        self.recorder.set_noise_reduction(self.app_settings.get("noise_reduction", False))
 
         self.system_devices = []
         self.mic_devices = []
@@ -1488,6 +1647,8 @@ class App:
         self.mode_var = tk.StringVar(value=self.app_settings["mode"])
         self.api_key_var = tk.StringVar(value=self.app_settings["openai_api_key"])
         self.vocab_prompt_var = tk.StringVar(value=self.app_settings.get("vocab_prompt", ""))
+        self.noise_reduction_var = tk.BooleanVar(value=self.app_settings.get("noise_reduction", False))
+        self.system_muted_var = tk.BooleanVar(value=False)
         self.system_device_var = tk.StringVar()
         self.mic_device_var = tk.StringVar()
         self.settings_summary_var = tk.StringVar()
@@ -1570,6 +1731,41 @@ class App:
                      text_color=self.text_color).pack(side="left", padx=(8, 0))
         return row
 
+    def _mute_toggle_button(self, parent):
+        return ctk.CTkButton(
+            parent, text="🔊", width=30, height=26, corner_radius=8,
+            fg_color="transparent", hover_color=self.accent_soft,
+            border_width=1, border_color=self.border_color,
+            text_color=self.text_color, font=self.font_small,
+            command=self.toggle_system_mute,
+        )
+
+    def toggle_system_mute(self):
+        muted = not self.system_muted_var.get()
+        self.system_muted_var.set(muted)
+        self.recorder.set_system_muted(muted)
+        icon = "🔇" if muted else "🔊"
+        color = "#fb7185" if muted else self.text_color
+        for btn in (getattr(self, "system_mute_btn", None), getattr(self, "system_mute_btn_record", None)):
+            if btn is not None:
+                btn.configure(text=icon, text_color=color)
+        self.add_log(
+            "スピーカー（相手音声）の録音をミュートにしました。" if muted
+            else "スピーカー（相手音声）の録音のミュートを解除しました。"
+        )
+
+    def on_noise_reduction_changed(self):
+        enabled = self.noise_reduction_var.get()
+        self.app_settings["noise_reduction"] = enabled
+        self.recorder.set_noise_reduction(enabled)
+        if enabled and not NOISEREDUCE_AVAILABLE:
+            self.add_log(
+                "ノイズ除去を有効にしましたが、noisereduce が未インストールのため動作しません"
+                "（pip install noisereduce numpy）。"
+            )
+        else:
+            self.add_log("ノイズ除去を有効にしました。" if enabled else "ノイズ除去を無効にしました。")
+
     def build_ui(self):
         self.tabview = ctk.CTkTabview(
             self.root,
@@ -1621,8 +1817,12 @@ class App:
         device_card = self._card(home_tab)
         device_card.pack(fill="x", pady=(0, 12))
         self._section_header(device_card, "録音デバイス選択").pack(fill="x", padx=16, pady=(14, 10))
-        ctk.CTkLabel(device_card, text="スピーカー / 相手音声", font=self.font_small,
-                     text_color=self.muted_color, anchor="w").pack(fill="x", padx=16)
+        system_label_row = ctk.CTkFrame(device_card, fg_color="transparent")
+        system_label_row.pack(fill="x", padx=16)
+        ctk.CTkLabel(system_label_row, text="スピーカー / 相手音声", font=self.font_small,
+                     text_color=self.muted_color, anchor="w").pack(side="left")
+        self.system_mute_btn = self._mute_toggle_button(system_label_row)
+        self.system_mute_btn.pack(side="right")
         self.system_combo = self._option_menu(device_card, self.system_device_var,
                                                ["(読み込み中)"], self.on_device_changed)
         self.system_combo.pack(fill="x", padx=16, pady=(4, 12))
@@ -1742,6 +1942,19 @@ class App:
                           "（例: 伴走型DX相談, IPA, 西端, ハピネス社）。",
                      font=self.font_small, text_color=self.muted_color, wraplength=360,
                      justify="left", anchor="w").grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 4))
+        ctk.CTkLabel(settings_frame, text="ノイズ除去", font=self.font_body,
+                     text_color=self.text_color).grid(row=6, column=0, sticky="w", pady=6)
+        self.noise_reduction_switch = ctk.CTkSwitch(
+            settings_frame, text="", variable=self.noise_reduction_var,
+            command=self.on_noise_reduction_changed,
+            fg_color=self.border_color, progress_color=self.accent_color,
+        )
+        self.noise_reduction_switch.grid(row=6, column=1, sticky="w", padx=(12, 0), pady=6)
+        ctk.CTkLabel(settings_frame,
+                     text="録音停止時に背景ノイズを軽減します（5%未満の小さな音は常にカットされます）。"
+                          "録音が長いと停止処理に数秒〜数十秒余分にかかる場合があります。",
+                     font=self.font_small, text_color=self.muted_color, wraplength=360,
+                     justify="left", anchor="w").grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 4))
         settings_frame.columnconfigure(1, weight=1)
         self.refresh_api_key_entry_state()
         self.refresh_settings_summary()
@@ -1761,6 +1974,10 @@ class App:
             f"mode={self.app_settings['mode']}, beam_size={self.app_settings['beam_size']}, "
             f"compute_type={self.app_settings['compute_type']}"
         )
+        if not PYCAW_AVAILABLE:
+            self.add_log("pycawが利用できないため、OSマイクミュートとの同期は無効です（pip install pycaw comtypes）。")
+        if not NOISEREDUCE_AVAILABLE:
+            self.add_log("noisereduceが利用できないため、ノイズ除去機能は無効です（pip install noisereduce numpy）。")
 
     def build_recording_view(self):
         self.recording_frame = ctk.CTkFrame(self.root, fg_color=self.bg_color)
@@ -1775,8 +1992,12 @@ class App:
 
         system_card = self._card(levels_frame)
         system_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        ctk.CTkLabel(system_card, text="相手音声", font=self.font_section,
-                     text_color=self.text_color, anchor="w").pack(fill="x", padx=12, pady=(10, 2))
+        sys_header = ctk.CTkFrame(system_card, fg_color="transparent")
+        sys_header.pack(fill="x", padx=12, pady=(10, 2))
+        ctk.CTkLabel(sys_header, text="相手音声", font=self.font_section,
+                     text_color=self.text_color, anchor="w").pack(side="left")
+        self.system_mute_btn_record = self._mute_toggle_button(sys_header)
+        self.system_mute_btn_record.pack(side="right")
         self.recording_system_device_label = ctk.CTkLabel(
             system_card, textvariable=self.recording_system_device_var,
             font=self.font_small, text_color=self.muted_color, wraplength=180,
@@ -1801,6 +2022,11 @@ class App:
             justify="left", anchor="w",
         )
         self.recording_mic_device_label.pack(fill="x", padx=12, pady=(0, 6))
+        self.mic_os_mute_label = ctk.CTkLabel(
+            mic_card, text="", font=self.font_small, text_color="#fb7185",
+            wraplength=180, justify="left", anchor="w",
+        )
+        self.mic_os_mute_label.pack(fill="x", padx=12, pady=(0, 4))
         mic_meter = ctk.CTkFrame(mic_card, fg_color="transparent")
         mic_meter.pack(fill="x", padx=12, pady=(0, 12))
         self.recording_mic_bar = ctk.CTkProgressBar(mic_meter, progress_color=self.accent_color, height=14)
@@ -1840,6 +2066,9 @@ class App:
             self.recording_system_bar.set(max(0, min(100, system_level)) / 100)
         if hasattr(self, "recording_mic_bar"):
             self.recording_mic_bar.set(max(0, min(100, mic_level)) / 100)
+        if hasattr(self, "mic_os_mute_label"):
+            muted = bool(self.recorder.is_recording and self.recorder.mic_muted_by_os)
+            self.mic_os_mute_label.configure(text="🔇 マイクはOS側でミュート中です" if muted else "")
 
     def save_recording_memo(self, output_dir):
         memo = self.memo_text.get("1.0", "end").strip()
