@@ -6,6 +6,7 @@ import audioop
 import json
 import struct
 import threading
+import time
 import subprocess
 import traceback
 import wave
@@ -30,7 +31,7 @@ from faster_whisper import WhisperModel
 # =========================
 APP_TITLE = "レコードApp"
 # PRごとにこのバージョンを更新し、PRタイトルにも同じバージョンを含める。
-APP_VERSION = "1.03"
+APP_VERSION = "1.04"
 
 BASE_DIR = Path.cwd() / "mtg_records"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -76,10 +77,22 @@ DEFAULT_SETTINGS = {
     "beam_size": BEAM_SIZE,
     "compute_type": COMPUTE_TYPE,
     "openai_api_key": "",
+    "vocab_prompt": "",
 }
 
 API_TRANSCRIBE_MODELS = {"gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-4o-transcribe-diarize"}
-API_CHUNK_SECONDS = 1000
+
+# OpenAI 音声文字起こしAPIは 1リクエストあたり 25MB まで。
+# 25MB の上限に対して安全マージンを取ったサイズを分割の基準にする。
+API_UPLOAD_LIMIT_BYTES = 25 * 1024 * 1024
+API_UPLOAD_SAFETY_BYTES = 24 * 1024 * 1024
+# 送信音声のビットレート。話者分離の精度を確保するため 32k から引き上げる。
+API_CHUNK_BITRATE = "64k"
+API_CHUNK_BITRATE_BPS = 64000
+# ビットレートとサイズ上限からチャンクの最大秒数を逆算する。
+# コンテナ等のオーバーヘッド分を割り引く。約48分となり、大半の会議は
+# 分割不要（＝話者分離がチャンクをまたがない）になる。
+API_CHUNK_SECONDS = int(API_UPLOAD_SAFETY_BYTES * 8 / API_CHUNK_BITRATE_BPS * 0.92)
 API_OVERLAP_SECONDS = 3
 API_KEY_MASK = "******************"
 
@@ -463,26 +476,36 @@ class AudioRecorder:
                 rate_candidates.append(r)
 
         last_error = None
-        for ch in channel_candidates:
-            for r in rate_candidates:
-                try:
-                    stream = self.p.open(
-                        format=FORMAT,
-                        channels=ch,
-                        rate=int(r),
-                        input=True,
-                        input_device_index=device_index,
-                        frames_per_buffer=CHUNK,
-                    )
-                    if label == "相手音声":
-                        self.system_channels = ch
-                        self.system_rate = int(r)
-                    else:
-                        self.mic_channels = ch
-                        self.mic_rate = int(r)
-                    return stream
-                except Exception as e:
-                    last_error = e
+        # プレビュー用ストリームを閉じた直後などは、WASAPI 側でデバイスの
+        # 解放が完了しておらず open が一時的に失敗することがある。
+        # 少し待って数回リトライすることで「録音がエラーで始まらない」現象を防ぐ。
+        for stream_attempt in range(3):
+            for ch in channel_candidates:
+                for r in rate_candidates:
+                    try:
+                        stream = self.p.open(
+                            format=FORMAT,
+                            channels=ch,
+                            rate=int(r),
+                            input=True,
+                            input_device_index=device_index,
+                            frames_per_buffer=CHUNK,
+                        )
+                        if label == "相手音声":
+                            self.system_channels = ch
+                            self.system_rate = int(r)
+                        else:
+                            self.mic_channels = ch
+                            self.mic_rate = int(r)
+                        return stream
+                    except Exception as e:
+                        last_error = e
+            if stream_attempt < 2:
+                self.log(
+                    f"{label} のデバイスがまだ使用中の可能性があります。"
+                    f"少し待って再試行します（{stream_attempt + 1}/3）。"
+                )
+                time.sleep(0.4)
 
         write_error_log(f"{label} open failed all candidates", last_error)
         raise RuntimeError(f"{label} の録音開始に失敗しました: {last_error}")
@@ -526,29 +549,18 @@ class AudioRecorder:
 
         self.is_recording = False
 
-        if self.system_thread:
-            self.system_thread.join(timeout=1)
-            self.system_thread = None
+        # キャプチャスレッドの stream.read() はブロッキング呼び出し。
+        # デバイス切断などで read() が返らないまま別スレッドから stream.close()
+        # を呼ぶと PortAudio がネイティブレベルでクラッシュし、アプリが落ちて
+        # 録音データも保存されないことがある（「停止したら落ちて録画できていない」現象）。
+        # そのため「スレッドが確実に終了してから」stream を閉じる。
+        system_alive = self._join_capture_thread("system")
+        mic_alive = self._join_capture_thread("mic")
 
-        if self.mic_thread:
-            self.mic_thread.join(timeout=1)
-            self.mic_thread = None
+        self._safe_close_stream("system", thread_alive=system_alive)
+        self._safe_close_stream("mic", thread_alive=mic_alive)
 
-        try:
-            if self.system_stream:
-                self.system_stream.stop_stream()
-                self.system_stream.close()
-                self.system_stream = None
-        except Exception as e:
-            write_error_log("stop system_stream error", e)
-
-        try:
-            if self.mic_stream:
-                self.mic_stream.stop_stream()
-                self.mic_stream.close()
-                self.mic_stream = None
-        except Exception as e:
-            write_error_log("stop mic_stream error", e)
+        streams_stuck = system_alive or mic_alive
 
         result = None
 
@@ -618,10 +630,15 @@ class AudioRecorder:
             raise
 
         finally:
+            # スレッドがまだ read() でブロック中の場合、p.terminate() も
+            # 内部でストリームを閉じてクラッシュしうるため terminate しない。
+            # PyAudio インスタンスはリークするが、次回録音開始時に作り直す。
             try:
-                if self.p:
+                if self.p and not streams_stuck:
                     self.p.terminate()
                     self.p = None
+                elif streams_stuck:
+                    self.log("オーディオデバイスの解放をスキップしました（次回録音時に再初期化されます）。")
             except Exception as e:
                 write_error_log("terminate PyAudio error", e)
 
@@ -629,6 +646,40 @@ class AudioRecorder:
             self.mic_level = 0
 
         return result
+
+    def _join_capture_thread(self, kind):
+        thread = getattr(self, f"{kind}_thread")
+        if not thread:
+            return False
+        # 通常 read() は数十msで返るため、十分な猶予をとって待つ。
+        thread.join(timeout=5)
+        alive = thread.is_alive()
+        if not alive:
+            setattr(self, f"{kind}_thread", None)
+        else:
+            write_error_log(
+                f"stop {kind} thread still alive",
+                RuntimeError(f"{kind} capture thread did not stop in time"),
+            )
+        return alive
+
+    def _safe_close_stream(self, kind, thread_alive):
+        stream = getattr(self, f"{kind}_stream")
+        if not stream:
+            return
+        if thread_alive:
+            # スレッドが read() でブロック中の可能性があるため close しない。
+            # ハンドルはリークするが、次回録音時に PyAudio を作り直すため許容する。
+            self.log(f"{kind} のキャプチャが停止しないため、ストリームを安全に閉じられませんでした。")
+            setattr(self, f"{kind}_stream", None)
+            return
+        try:
+            stream.stop_stream()
+            stream.close()
+        except Exception as e:
+            write_error_log(f"stop {kind}_stream error", e)
+        finally:
+            setattr(self, f"{kind}_stream", None)
 
     def _calc_level(self, data):
         if not data:
@@ -743,6 +794,7 @@ class Transcriber:
         self.beam_size = BEAM_SIZE
         self.openai_api_key = ""
         self.openai_api_key_from_env = False
+        self.vocab_prompt = ""
         self.model_lock = threading.Lock()
 
     def resolve_api_key(self, user_api_key=""):
@@ -765,6 +817,7 @@ class Transcriber:
             self.model_size = model_size
             self.compute_type = compute_type
             self.beam_size = int(settings["beam_size"])
+            self.vocab_prompt = (settings.get("vocab_prompt", "") or "").strip()
 
     def preload_model(self):
         try:
@@ -804,6 +857,12 @@ class Transcriber:
                 rows = self._transcribe_file_api(audio_path, speaker_label, diarized_prefix=diarized_prefix)
             else:
                 self.preload_model()
+                # 固有名詞ヒントを initial_prompt に渡す。
+                # Whisper の prompt は末尾約224トークンのみ有効なため、
+                # 長すぎる場合は末尾側を優先して安全な長さに丸める。
+                initial_prompt = (self.vocab_prompt or "").strip() or None
+                if initial_prompt and len(initial_prompt) > 200:
+                    initial_prompt = initial_prompt[-200:]
                 segments, info = self.model.transcribe(
                     str(audio_path),
                     language=LANGUAGE,
@@ -815,6 +874,7 @@ class Transcriber:
                     temperature=0.0,
                     condition_on_previous_text=False,
                     word_timestamps=False,
+                    initial_prompt=initial_prompt,
                 )
 
                 for seg in segments:
@@ -852,7 +912,8 @@ class Transcriber:
         if duration <= API_CHUNK_SECONDS:
             return self._transcribe_api_single(audio_path, speaker_label, offset_sec=0.0, diarized_prefix=diarized_prefix)
 
-        rows = []
+        is_diarize = self.model_size == "gpt-4o-transcribe-diarize"
+        chunk_row_lists = []
         start_sec = 0.0
         chunk_index = 1
         while start_sec < duration:
@@ -868,11 +929,80 @@ class Transcriber:
                 diarized_prefix=diarized_prefix,
                 diarized_chunk_index=chunk_index,
             )
-            rows = self._merge_api_chunk_rows(rows, chunk_rows)
+            chunk_row_lists.append(chunk_rows)
             start_sec = end_sec
             chunk_index += 1
 
+        # 話者分離ではチャンクをまたいで同一話者をできるだけ同じラベルに統合する。
+        if is_diarize:
+            self._unify_diarized_speakers(
+                chunk_row_lists,
+                diarized_prefix or speaker_label or "話者",
+            )
+
+        rows = []
+        for chunk_rows in chunk_row_lists:
+            rows = self._merge_api_chunk_rows(rows, chunk_rows)
         return rows
+
+    def _unify_diarized_speakers(self, chunk_row_lists, prefix):
+        # チャンク分割された diarize 結果で、チャンクをまたいで同一話者を
+        # できるだけ同じラベルにまとめる。チャンク境界のオーバーラップ区間で
+        # 同じ発話（テキスト一致）が現れることを手がかりにマッチングする。
+        # 確実な同定はできないため、マッチしない話者には新しい番号を振る
+        # （＝誤って別人を同一化しない安全側の割り当て）。
+        global_map = {}
+        next_global = [1]
+        prev_rows = []
+
+        def assign_new(key):
+            gid = next_global[0]
+            next_global[0] += 1
+            global_map[key] = gid
+            return gid
+
+        for chunk_pos, chunk_rows in enumerate(chunk_row_lists):
+            first_row_by_raw = {}
+            for row in chunk_rows:
+                raw = row.get("api_speaker")
+                if raw is None:
+                    continue
+                if raw not in first_row_by_raw:
+                    first_row_by_raw[raw] = row
+
+            for raw, first_row in first_row_by_raw.items():
+                ci = first_row.get("api_chunk_index", chunk_pos + 1)
+                key = (ci, raw)
+                if key in global_map:
+                    continue
+                matched_gid = None
+                if chunk_pos > 0:
+                    normalized = self._normalized_text(first_row.get("text", ""))
+                    start = float(first_row.get("start", 0.0))
+                    if normalized:
+                        for old in prev_rows:
+                            near = abs(float(old.get("start", 0.0)) - start) <= (API_OVERLAP_SECONDS * 2)
+                            if near and self._normalized_text(old.get("text", "")) == normalized:
+                                matched_gid = old.get("_global_speaker")
+                                if matched_gid is not None:
+                                    break
+                if matched_gid is not None:
+                    global_map[key] = matched_gid
+                else:
+                    assign_new(key)
+
+            for row in chunk_rows:
+                raw = row.get("api_speaker")
+                if raw is None:
+                    continue
+                ci = row.get("api_chunk_index", chunk_pos + 1)
+                gid = global_map.get((ci, raw))
+                if gid is None:
+                    gid = assign_new((ci, raw))
+                row["_global_speaker"] = gid
+                row["speaker"] = f"{prefix}{gid}"
+
+            prev_rows = chunk_rows
 
     def _probe_duration_seconds(self, audio_path):
         cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", str(audio_path)]
@@ -916,7 +1046,7 @@ class Transcriber:
                 "-c:a",
                 "aac",
                 "-b:a",
-                "32k",
+                API_CHUNK_BITRATE,
                 str(temp_path),
             ]
             subprocess.run(
@@ -990,6 +1120,14 @@ class Transcriber:
             add_field("chunking_strategy", "auto")
         else:
             add_field("response_format", "json")
+            # 出力のブレを抑えるため温度を明示的に 0 にする。
+            # diarize モデルは temperature 非対応のため送らない。
+            add_field("temperature", "0")
+        # 固有名詞・専門用語のヒント（設定画面で入力）。
+        # 言語判定のブレや固有名詞の誤変換を減らす。
+        vocab_prompt = (getattr(self, "vocab_prompt", "") or "").strip()
+        if vocab_prompt:
+            add_field("prompt", vocab_prompt)
 
         parts.append(f"--{boundary}\r\n".encode("utf-8"))
         parts.append(
@@ -1010,36 +1148,56 @@ class Transcriber:
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
             },
         )
+        # 429（レート制限）や 5xx の一時エラーは指数バックオフで再試行する。
+        # system/mic を並列実行すると 429 を踏みやすいため、対応は重要。
+        max_attempts = 5
+        retry_status = {429, 500, 502, 503, 504}
         last_error = None
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 with urllib.request.urlopen(req, timeout=600) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
                 break
             except urllib.error.HTTPError as e:
-                body = ""
+                err_body = ""
                 try:
-                    body = (e.read() or b"").decode("utf-8", errors="replace")
+                    err_body = (e.read() or b"").decode("utf-8", errors="replace")
                 except Exception:
-                    body = ""
-                message = f"HTTP {e.code}: {body}" if body else f"HTTP {e.code}: {e.reason}"
-                if e.code == 400 and "input too large" in body.lower():
+                    err_body = ""
+                message = f"HTTP {e.code}: {err_body}" if err_body else f"HTTP {e.code}: {e.reason}"
+                if e.code == 400 and "input too large" in err_body.lower():
                     raise RuntimeError(message)
-                if e.code == 502 and attempt < 2:
-                    wait_seconds = 2 ** attempt
-                    self.log(f"API一時エラーのため再試行します: {attempt + 1}/3 ({wait_seconds}秒待機)")
+                if e.code in retry_status and attempt < max_attempts - 1:
+                    retry_after = None
+                    try:
+                        header_val = e.headers.get("Retry-After") if e.headers else None
+                        if header_val:
+                            retry_after = float(header_val)
+                    except Exception:
+                        retry_after = None
+                    wait_seconds = retry_after if retry_after is not None else min(30, 2 ** attempt)
+                    kind = "レート制限" if e.code == 429 else "API一時エラー"
+                    self.log(
+                        f"{kind}のため再試行します: {attempt + 1}/{max_attempts} "
+                        f"({wait_seconds:.0f}秒待機)"
+                    )
                     threading.Event().wait(wait_seconds)
                     continue
                 raise RuntimeError(message)
-            except Exception as e:
+            except urllib.error.URLError as e:
+                # タイムアウト・接続エラー等の一時的な失敗はリトライする。
                 last_error = e
-                if "502" not in str(e) or attempt == 2:
+                if attempt >= max_attempts - 1:
                     raise
-                wait_seconds = 2 ** attempt
-                self.log(f"API一時エラーのため再試行します: {attempt + 1}/3 ({wait_seconds}秒待機)")
+                wait_seconds = min(30, 2 ** attempt)
+                self.log(
+                    f"API接続エラーのため再試行します: {attempt + 1}/{max_attempts} "
+                    f"({wait_seconds}秒待機)"
+                )
                 threading.Event().wait(wait_seconds)
         else:
-            raise last_error
+            if last_error:
+                raise last_error
 
         rows = []
         diarized_speakers = {}
@@ -1055,10 +1213,9 @@ class Transcriber:
                     diarized_speakers[raw_speaker] = len(diarized_speakers) + 1
                 prefix = diarized_prefix or speaker_label or "話者"
                 speaker_index = diarized_speakers[raw_speaker]
-                if diarized_chunk_index is None:
-                    segment_speaker = f"{prefix}{speaker_index}"
-                else:
-                    segment_speaker = f"{prefix}C{diarized_chunk_index}-{speaker_index}"
+                # チャンク分割時も暫定的に {prefix}{n} を付け、後段の
+                # _unify_diarized_speakers でチャンクをまたいだ話者ラベルを統合する。
+                segment_speaker = f"{prefix}{speaker_index}"
             row = {
                 "start": float(seg.get("start", 0.0)) + offset_sec,
                 "end": float(seg.get("end", 0.0)) + offset_sec,
@@ -1211,6 +1368,7 @@ class App:
         self.model_var = tk.StringVar(value=MODEL_CHOICES[self.app_settings["model_size"]])
         self.mode_var = tk.StringVar(value=self.app_settings["mode"])
         self.api_key_var = tk.StringVar(value=self.app_settings["openai_api_key"])
+        self.vocab_prompt_var = tk.StringVar(value=self.app_settings.get("vocab_prompt", ""))
         self.settings_summary_var = tk.StringVar()
         self.recording_system_device_var = tk.StringVar(value="相手音声")
         self.recording_mic_device_var = tk.StringVar(value="マイク")
@@ -1497,6 +1655,20 @@ class App:
             justify="left",
         )
         self.api_key_note_label.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+
+        ttk.Label(settings_frame, text="固有名詞・専門用語", style="Card.TLabel").grid(row=5, column=0, sticky="nw")
+        self.vocab_prompt_entry = ttk.Entry(settings_frame, textvariable=self.vocab_prompt_var, width=30)
+        self.vocab_prompt_entry.grid(row=5, column=1, sticky="ew", padx=(12, 0), pady=(0, 8))
+        self.vocab_prompt_entry.bind("<FocusOut>", self.on_transcription_setting_changed)
+        ttk.Label(
+            settings_frame,
+            text="会議でよく出る固有名詞・専門用語をカンマ区切りで入力すると、"
+                 "文字起こしの誤変換や言語の取り違えを減らせます"
+                 "（例: 伴走型DX相談, IPA, 西端, ハピネス社）。",
+            style="Muted.Card.TLabel",
+            wraplength=340,
+            justify="left",
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
         settings_frame.columnconfigure(1, weight=1)
         self.model_combo.bind("<<ComboboxSelected>>", self.on_transcription_setting_changed)
@@ -1790,6 +1962,7 @@ class App:
             self.model_var.set(MODEL_CHOICES[self.app_settings["model_size"]])
             self.mode_var.set(self.app_settings["mode"])
             self.api_key_var.set(self.app_settings.get("openai_api_key", ""))
+            self.vocab_prompt_var.set(self.app_settings.get("vocab_prompt", ""))
             self.refresh_settings_summary()
             safe_messagebox_error("エラー", "文字起こし中は設定を変更できません。完了後に変更してください。")
             return
@@ -1801,6 +1974,7 @@ class App:
             "beam_size": MODE_CHOICES[mode],
             "compute_type": COMPUTE_TYPE,
             "openai_api_key": "" if self.api_key_var.get() == API_KEY_MASK else self.api_key_var.get().strip(),
+            "vocab_prompt": self.vocab_prompt_var.get().strip(),
         }
 
         self.app_settings = settings
