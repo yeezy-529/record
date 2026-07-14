@@ -21,6 +21,7 @@ Windows で会議音声を録音し、録音フォルダや動画を文字起こ
   - `pyaudiowpatch`
   - `faster-whisper`
   - `customtkinter`
+  - `openai`（OpenAI API モデルを使う場合）
 
 `tkinter` は GUI の土台に使用します（`customtkinter` は `tkinter` の上に構築されています）。
 利用する Python 環境で `tkinter` が使えることを確認してください。
@@ -30,7 +31,7 @@ Windows で会議音声を録音し、録音フォルダや動画を文字起こ
 依存パッケージをインストールします。
 
 ```powershell
-python -m pip install pyaudiowpatch faster-whisper customtkinter
+python -m pip install pyaudiowpatch faster-whisper customtkinter openai
 ```
 
 動画の音声抽出と一部の音声変換で `ffmpeg` を使います。
